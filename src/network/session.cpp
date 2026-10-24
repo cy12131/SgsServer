@@ -11,10 +11,17 @@
 
 namespace cardgame::server::network {
 
-Session::Session(boost::asio::ip::tcp::socket socket, CloseHandler on_close)
+Session::Session(
+    std::uint64_t session_id,
+    boost::asio::ip::tcp::socket socket,
+    lobby::LobbyService& lobby_service,
+    CloseHandler on_close,
+    DeliveryHandler deliver)
     : socket_(std::move(socket)),
       handshake_timer_(socket_.get_executor()),
-      on_close_(std::move(on_close)) {}
+      on_close_(std::move(on_close)),
+      deliver_(std::move(deliver)),
+      router_(lobby_service, session_id) {}
 
 void Session::start() {
     start_handshake_timer();
@@ -85,9 +92,16 @@ void Session::handle_body() {
         handshake_timer_.cancel();
     }
     send(std::move(result.response), result.close_after_write);
+    if (!result.notifications.empty()) {
+        deliver_(std::move(result.notifications));
+    }
     if (!result.close_after_write) {
         read_header();
     }
+}
+
+void Session::send_notification(protocol::Message message) {
+    send(std::move(message), false);
 }
 
 void Session::send(protocol::Message message, bool close_after) {

@@ -17,11 +17,18 @@ namespace cardgame::server::network {
 class Session final : public std::enable_shared_from_this<Session> {
 public:
     using CloseHandler = std::function<void(const std::shared_ptr<Session>&)>;
+    using DeliveryHandler = std::function<void(std::vector<lobby::Notification>)>;
 
-    Session(boost::asio::ip::tcp::socket socket, CloseHandler on_close);
+    Session(
+        std::uint64_t session_id,
+        boost::asio::ip::tcp::socket socket,
+        lobby::LobbyService& lobby_service,
+        CloseHandler on_close,
+        DeliveryHandler deliver);
 
     void start();
     void close();
+    void send_notification(protocol::Message message);
 
 private:
     struct PendingWrite {
@@ -39,6 +46,7 @@ private:
     boost::asio::ip::tcp::socket socket_;
     boost::asio::steady_timer handshake_timer_;
     CloseHandler on_close_;
+    DeliveryHandler deliver_;
     protocol::MessageRouter router_;
     std::array<std::uint8_t, 4> header_{};
     std::vector<std::uint8_t> body_;

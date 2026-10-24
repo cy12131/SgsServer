@@ -1,5 +1,6 @@
 # CMake 构建输出
 /build/
+/build-*/
 /cmake-build-*/
 /out/
 

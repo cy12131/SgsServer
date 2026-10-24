@@ -19,6 +19,9 @@ endfunction()
 
 add_library(cardgame_server_core STATIC
     src/application.cpp
+    src/lobby/lobby_service.cpp
+    src/lobby/room_manager.cpp
+    src/lobby/user_manager.cpp
     src/network/session.cpp
     src/network/tcp_server.cpp
     src/protocol/message_codec.cpp
@@ -57,4 +60,12 @@ if(BUILD_TESTING)
                 "$<TARGET_FILE:cardgame-server>"
     )
     set_tests_properties(network_integration PROPERTIES TIMEOUT 30)
+
+    add_test(
+        NAME lobby_room_integration
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/lobby_room_integration_test.py"
+                "$<TARGET_FILE:cardgame-server>"
+    )
+    set_tests_properties(lobby_room_integration PROPERTIES TIMEOUT 45)
 endif()

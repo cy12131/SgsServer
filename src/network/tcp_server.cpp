@@ -5,6 +5,7 @@
 #include <boost/asio/ip/address.hpp>
 #include <boost/system/system_error.hpp>
 
+#include <algorithm>
 #include <csignal>
 #include <ostream>
 #include <utility>
@@ -45,17 +46,49 @@ void TcpServer::start_accept() {
         [this](const boost::system::error_code& error,
                boost::asio::ip::tcp::socket socket) {
             if (!error) {
+                const std::uint64_t session_id = next_session_id_++;
                 auto session = std::make_shared<Session>(
-                    std::move(socket), [this](const std::shared_ptr<Session>& closed) {
-                        sessions_.erase(closed);
+                    session_id,
+                    std::move(socket),
+                    lobby_service_,
+                    [this](const std::shared_ptr<Session>& closed) {
+                        session_closed(closed);
+                    },
+                    [this](std::vector<lobby::Notification> notifications) {
+                        deliver(std::move(notifications));
                     });
-                sessions_.insert(session);
+                sessions_.emplace(session_id, session);
                 session->start();
             }
             if (!stopped_ && acceptor_.is_open()) {
                 start_accept();
             }
         });
+}
+
+void TcpServer::session_closed(const std::shared_ptr<Session>& session) {
+    const auto iterator = std::find_if(
+        sessions_.begin(), sessions_.end(), [&session](const auto& entry) {
+            return entry.second == session;
+        });
+    if (iterator == sessions_.end()) {
+        return;
+    }
+    const std::uint64_t session_id = iterator->first;
+    std::vector<lobby::Notification> notifications = lobby_service_.disconnect(session_id);
+    sessions_.erase(iterator);
+    if (!stopped_) {
+        deliver(std::move(notifications));
+    }
+}
+
+void TcpServer::deliver(std::vector<lobby::Notification> notifications) {
+    for (lobby::Notification& notification : notifications) {
+        const auto target = sessions_.find(notification.session_id);
+        if (target != sessions_.end()) {
+            target->second->send_notification(std::move(notification.message));
+        }
+    }
 }
 
 void TcpServer::wait_for_signal() {
@@ -79,8 +112,12 @@ void TcpServer::stop() {
     acceptor_.close(ignored);
     signals_.cancel(ignored);
 
-    const std::vector<std::shared_ptr<Session>> active{
-        sessions_.begin(), sessions_.end()};
+    std::vector<std::shared_ptr<Session>> active;
+    active.reserve(sessions_.size());
+    for (const auto& [session_id, session] : sessions_) {
+        static_cast<void>(session_id);
+        active.push_back(session);
+    }
     for (const auto& session : active) {
         session->close();
     }
