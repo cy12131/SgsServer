@@ -1,39 +1,49 @@
-# CardGameServer
+# SgsServer
 
-CardGameServer 是一个独立开发的 Linux 多人回合制卡牌游戏服务端。本仓库当前处于 M0，目标是提供干净、可构建、可测试的进程骨架；它不依赖 FreeKill，也不兼容或复用其客户端、服务端和扩展包。
+SgsServer 是独立开发的 Linux 多人在线回合制卡牌游戏服务端。M1-S 已实现基于 C++20、Boost.Asio 和 Boost.JSON 的最小异步 TCP 通信层，不依赖 FreeKill。
 
-## 技术栈
+当前能力包括 SGS/1 长度前缀帧、JSON 编解码、Hello 握手、Ping/Pong、Echo、错误响应、10 秒握手超时、安全断开和信号停止。尚未实现认证、房间、游戏规则、Lua、数据库或资源系统。
 
-- C++20
-- CMake 3.20 或更高版本
-- CTest
-- Linux / GCC（代码本身不写死发行版路径）
+## 依赖
 
-当前仅实现 `Application` 启动入口、版本与成功信息输出，以及最小 smoke test。尚未实现网络、协议、线程、房间、游戏规则、Lua、认证、数据库或资源包功能。
+- CMake 3.20+
+- 支持 C++20 的编译器
+- Boost 1.83+，需要 Asio 头文件和 Boost.JSON
+- Python 3，仅用于自动化 TCP 集成测试
 
-## 构建
+Ubuntu/Debian 对应开发包通常为 `libboost-dev`、`libboost-json-dev` 和 `python3`。本项目不会自动下载安装依赖。
+
+## 构建与测试
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j2
-```
-
-Release 构建可将 `CMAKE_BUILD_TYPE` 改为 `Release`。
-
-## 运行
-
-```bash
-./build/cardgame-server
-```
-
-## 测试
-
-```bash
 ctest --test-dir build --output-on-failure
 ```
 
-## 后续阶段概览
+CTest 会启动本机真实 TCP 服务端，测试具有明确超时。Release 构建可将 `CMAKE_BUILD_TYPE` 改为 `Release`。
 
-M1 可在总体架构和双端通信协议确定后，引入实际需要的 Boost.Asio 网络基础设施，并明确连接生命周期与错误处理。后续里程碑再逐步加入会话、房间、权威游戏状态和 Lua 规则模块；每个阶段只增加当期可验证的能力。
+## 启动配置
 
-架构边界见 [docs/architecture.md](docs/architecture.md)，当前验收状态见 [docs/milestone_status.md](docs/milestone_status.md)。
+默认仅监听回环地址，适合本机测试：
+
+```bash
+./build/cardgame-server
+# 监听 127.0.0.1:18765
+```
+
+可通过环境变量覆盖：
+
+```bash
+SGS_BIND_ADDRESS=127.0.0.1 SGS_PORT=18765 ./build/cardgame-server
+```
+
+只有显式设置 `SGS_BIND_ADDRESS=0.0.0.0` 才会监听所有 IPv4 网卡。这样做会把未包含认证和加密的 M1 服务暴露给同网段或公网；跨设备联调前应配置防火墙，只开放可信网络，并避免公网直接暴露。
+
+按 `Ctrl+C` 或发送 `SIGTERM` 可安全停止。端口必须为 1～65535。
+
+## Windows 客户端联调
+
+同机环境连接 `127.0.0.1:18765`。跨设备时，服务端显式监听局域网地址或 `0.0.0.0`，Windows 客户端连接 Linux 主机的局域网 IPv4 地址与配置端口。连接后必须在 10 秒内按 [SGS/1 协议](docs/protocol.md)发送 Hello；TCP 字节流必须实现 4 字节大端长度头，不能假设一次读取就是一条完整消息。
+
+架构与生命周期见 [docs/architecture.md](docs/architecture.md)，验收状态见 [docs/milestone_status.md](docs/milestone_status.md)。
