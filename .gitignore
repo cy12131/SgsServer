@@ -1,0 +1,31 @@
+# CMake 构建输出
+/build/
+/cmake-build-*/
+/out/
+
+# 编译器与分析工具生成物
+compile_commands.json
+*.o
+*.a
+*.so
+*.log
+
+# 本地环境变量和私密凭据
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 编辑器与系统临时文件
+.idea/
+.vscode/
+*~
+.DS_Store
+
+# 本地 Agent 工作区元数据
+/.agents/
+/.codex/
+
+# 本地参考资料，不属于工程源码
+/freekill-asio-*.zip
