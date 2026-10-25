@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cardgame/server/lobby/lobby_service.h"
+
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/signal_set.hpp>
@@ -7,7 +9,7 @@
 #include <iosfwd>
 #include <memory>
 #include <string>
-#include <unordered_set>
+#include <unordered_map>
 
 namespace cardgame::server::network {
 
@@ -29,6 +31,8 @@ public:
 private:
     void start_accept();
     void wait_for_signal();
+    void session_closed(const std::shared_ptr<Session>& session);
+    void deliver(std::vector<lobby::Notification> notifications);
 
     std::string address_;
     unsigned short port_;
@@ -36,7 +40,9 @@ private:
     boost::asio::io_context io_context_;
     boost::asio::ip::tcp::acceptor acceptor_;
     boost::asio::signal_set signals_;
-    std::unordered_set<std::shared_ptr<Session>> sessions_;
+    lobby::LobbyService lobby_service_;
+    std::unordered_map<std::uint64_t, std::shared_ptr<Session>> sessions_;
+    std::uint64_t next_session_id_ = 1;
     bool stopped_ = false;
 };
 

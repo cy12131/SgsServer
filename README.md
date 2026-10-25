@@ -1,8 +1,8 @@
 # SgsServer
 
-SgsServer 是独立开发的 Linux 多人在线回合制卡牌游戏服务端。M1-S 已实现基于 C++20、Boost.Asio 和 Boost.JSON 的最小异步 TCP 通信层，不依赖 FreeKill。
+SgsServer 是独立开发的 Linux 多人在线回合制卡牌游戏服务端。M2-S 在异步 SGS/1 网络层上实现了进程内临时用户、大厅、房间、座位和准备状态管理，不依赖 FreeKill。
 
-当前能力包括 SGS/1 长度前缀帧、JSON 编解码、Hello 握手、Ping/Pong、Echo、错误响应、10 秒握手超时、安全断开和信号停止。尚未实现认证、房间、游戏规则、Lua、数据库或资源系统。
+当前能力包括 SGS/1 长度前缀帧、Hello/Ping/Echo、临时用户、房间列表、创建/加入/退出房间、准备状态、完整房间快照、断线清理、房主转移和大厅刷新通知。尚未实现永久账号、游戏规则、Lua、数据库、身份恢复或资源系统。
 
 ## 依赖
 
@@ -21,7 +21,7 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
 
-CTest 会启动本机真实 TCP 服务端，测试具有明确超时。Release 构建可将 `CMAKE_BUILD_TYPE` 改为 `Release`。
+CTest 会启动本机真实 TCP 服务端，分别执行 M1 网络回归和 M2 多客户端房间测试，所有测试均有明确超时。Release 构建可将 `CMAKE_BUILD_TYPE` 改为 `Release`。
 
 ## 启动配置
 
@@ -44,6 +44,6 @@ SGS_BIND_ADDRESS=127.0.0.1 SGS_PORT=18765 ./build/cardgame-server
 
 ## Windows 客户端联调
 
-同机环境连接 `127.0.0.1:18765`。跨设备时，服务端显式监听局域网地址或 `0.0.0.0`，Windows 客户端连接 Linux 主机的局域网 IPv4 地址与配置端口。连接后必须在 10 秒内按 [SGS/1 协议](docs/protocol.md)发送 Hello；TCP 字节流必须实现 4 字节大端长度头，不能假设一次读取就是一条完整消息。
+同机环境连接 `127.0.0.1:18765`。跨设备时，服务端显式监听局域网地址或 `0.0.0.0`，Windows 客户端连接 Linux 主机的局域网 IPv4 地址与配置端口。连接后必须在 10 秒内按 [SGS/1 协议](docs/protocol.md)发送 Hello，再发送 EnterLobby 创建临时身份；TCP 字节流必须实现 4 字节大端长度头，不能假设一次读取就是一条完整消息。
 
 架构与生命周期见 [docs/architecture.md](docs/architecture.md)，验收状态见 [docs/milestone_status.md](docs/milestone_status.md)。
