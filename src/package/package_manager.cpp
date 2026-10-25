@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cctype>
 #include <chrono>
@@ -23,6 +24,7 @@
 #include <sstream>
 #include <system_error>
 #include <sys/types.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -43,6 +45,59 @@ struct ProcessResult {
     int exit_code = -1;
     std::string output;
 };
+
+class RegistryLock final {
+public:
+    RegistryLock(const std::filesystem::path& path, int operation) {
+        descriptor_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (descriptor_ < 0) {
+            throw PackageError{"REGISTRY_LOCK_FAILED", "cannot open package registry lock"};
+        }
+        while (::flock(descriptor_, operation) != 0) {
+            if (errno == EINTR) continue;
+            ::close(descriptor_);
+            descriptor_ = -1;
+            throw PackageError{"REGISTRY_LOCK_FAILED", "cannot lock package registry"};
+        }
+    }
+
+    ~RegistryLock() {
+        if (descriptor_ >= 0) {
+            static_cast<void>(::flock(descriptor_, LOCK_UN));
+            ::close(descriptor_);
+        }
+    }
+
+    RegistryLock(const RegistryLock&) = delete;
+    RegistryLock& operator=(const RegistryLock&) = delete;
+
+private:
+    int descriptor_ = -1;
+};
+
+class TemporaryFileGuard final {
+public:
+    explicit TemporaryFileGuard(std::filesystem::path path)
+        : path_(std::move(path)) {}
+    ~TemporaryFileGuard() {
+        if (!released_) {
+            std::error_code ignored;
+            std::filesystem::remove(path_, ignored);
+        }
+    }
+    void release() noexcept { released_ = true; }
+
+private:
+    std::filesystem::path path_;
+    bool released_ = false;
+};
+
+std::filesystem::path new_registry_temporary_path(
+    const std::filesystem::path& registry_path) {
+    static std::atomic<std::uint64_t> counter{0};
+    return registry_path.string() + ".tmp." + std::to_string(::getpid()) + "." +
+           std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
+}
 
 std::string trim(std::string value) {
     while (!value.empty() && (value.back() == '\n' || value.back() == '\r' ||
@@ -263,13 +318,15 @@ PackageManager::PackageManager(Options options)
     : options_(std::move(options)),
       installs_root_(options_.root / "installed"),
       staging_root_(options_.root / ".staging"),
-      registry_path_(options_.root / "registry.json") {
+      registry_path_(options_.root / "registry.json"),
+      registry_lock_path_(options_.root / ".registry.lock") {
     if (options_.root.empty() || options_.sync_timeout_ms < 1000 ||
         options_.sync_timeout_ms > 1800000) {
         throw PackageError{"INVALID_PACKAGE_CONFIGURATION", "invalid package manager options"};
     }
     std::filesystem::create_directories(installs_root_);
     std::filesystem::create_directories(staging_root_);
+    RegistryLock lock{registry_lock_path_, LOCK_SH};
     load_registry();
 }
 
@@ -282,6 +339,11 @@ const InstalledPackage& PackageManager::install(
     if (!is_lower_hex_hash(commit, 40) && !is_lower_hex_hash(commit, 64)) {
         throw PackageError{"INVALID_GIT_COMMIT", "commit must be a full lowercase Git object ID"};
     }
+
+    // 排他锁从重新读取当前注册表开始，覆盖下载、验证、修改和持久化。
+    // 因此等待锁的管理进程不会用构造时的旧快照覆盖其他进程的新提交。
+    RegistryLock lock{registry_lock_path_, LOCK_EX};
+    load_registry();
 
     const std::filesystem::path staging = new_staging_path(staging_root_);
     StagingGuard guard{staging};
@@ -326,6 +388,13 @@ const InstalledPackage& PackageManager::install(
 
 const ActiveManifest& PackageManager::set_enabled(
     const std::vector<std::string>& desired_ids) {
+    RegistryLock lock{registry_lock_path_, LOCK_EX};
+    load_registry();
+    return set_enabled_locked(desired_ids);
+}
+
+const ActiveManifest& PackageManager::set_enabled_locked(
+    const std::vector<std::string>& desired_ids) {
     const std::vector<std::size_t> order = resolve_enabled(desired_ids);
     ActiveManifest candidate_manifest = build_active(order);
     std::set<std::string> desired(desired_ids.begin(), desired_ids.end());
@@ -347,6 +416,8 @@ const ActiveManifest& PackageManager::set_enabled(
 }
 
 const ActiveManifest& PackageManager::enable(std::string_view package_id) {
+    RegistryLock lock{registry_lock_path_, LOCK_EX};
+    load_registry();
     std::vector<std::string> desired;
     for (const InstalledPackage& package : installed_) {
         if (package.enabled || package.manifest.id == package_id) {
@@ -356,10 +427,12 @@ const ActiveManifest& PackageManager::enable(std::string_view package_id) {
     if (std::find(desired.begin(), desired.end(), package_id) == desired.end()) {
         throw PackageError{"PACKAGE_NOT_INSTALLED", "package is not installed"};
     }
-    return set_enabled(desired);
+    return set_enabled_locked(desired);
 }
 
 const ActiveManifest& PackageManager::disable(std::string_view package_id) {
+    RegistryLock lock{registry_lock_path_, LOCK_EX};
+    load_registry();
     std::vector<std::string> desired;
     bool found = false;
     for (const InstalledPackage& package : installed_) {
@@ -372,10 +445,11 @@ const ActiveManifest& PackageManager::disable(std::string_view package_id) {
     if (!found) {
         throw PackageError{"PACKAGE_NOT_INSTALLED", "package is not installed"};
     }
-    return set_enabled(desired);
+    return set_enabled_locked(desired);
 }
 
 void PackageManager::reload_registry() {
+    RegistryLock lock{registry_lock_path_, LOCK_SH};
     std::vector<InstalledPackage> previous_installed = installed_;
     ActiveManifest previous_active = active_;
     try {
@@ -662,21 +736,36 @@ void PackageManager::persist_registry(
     }
     const std::string serialized = boost::json::serialize(
         boost::json::object{{"schema_version", 1}, {"packages", std::move(entries)}});
-    const std::filesystem::path temporary = registry_path_.string() + ".tmp";
-    {
-        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-        output.write(serialized.data(), static_cast<std::streamsize>(serialized.size()));
-        output.flush();
-        if (!output) {
+    const std::filesystem::path temporary =
+        new_registry_temporary_path(registry_path_);
+    TemporaryFileGuard guard{temporary};
+    const int descriptor = ::open(
+        temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (descriptor < 0) {
+        throw PackageError{"REGISTRY_WRITE_FAILED", "cannot create package registry temporary"};
+    }
+    std::size_t offset = 0;
+    while (offset < serialized.size()) {
+        const ssize_t count = ::write(
+            descriptor, serialized.data() + offset, serialized.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            ::close(descriptor);
             throw PackageError{"REGISTRY_WRITE_FAILED", "cannot write package registry"};
         }
+        offset += static_cast<std::size_t>(count);
+    }
+    const bool flush_failed = ::fsync(descriptor) != 0;
+    const bool close_failed = ::close(descriptor) != 0;
+    if (flush_failed || close_failed) {
+        throw PackageError{"REGISTRY_WRITE_FAILED", "cannot flush package registry"};
     }
     std::error_code error;
     std::filesystem::rename(temporary, registry_path_, error);
     if (error) {
-        std::filesystem::remove(temporary);
         throw PackageError{"REGISTRY_WRITE_FAILED", "cannot atomically replace package registry"};
     }
+    guard.release();
 }
 
 }  // namespace cardgame::server::package

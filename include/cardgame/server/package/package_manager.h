@@ -85,6 +85,8 @@ private:
         const std::vector<std::string>& desired_ids) const;
     [[nodiscard]] ActiveManifest build_active(
         const std::vector<std::size_t>& order) const;
+    [[nodiscard]] const ActiveManifest& set_enabled_locked(
+        const std::vector<std::string>& desired_ids);
     void load_registry();
     void persist_registry(const std::vector<InstalledPackage>& packages) const;
 
@@ -92,6 +94,7 @@ private:
     std::filesystem::path installs_root_;
     std::filesystem::path staging_root_;
     std::filesystem::path registry_path_;
+    std::filesystem::path registry_lock_path_;
     std::vector<InstalledPackage> installed_;
     ActiveManifest active_;
     ManifestChangedHandler on_manifest_changed_;

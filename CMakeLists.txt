@@ -72,6 +72,13 @@ if(BUILD_TESTING)
     add_test(NAME package_manager COMMAND cardgame-package-test)
     set_tests_properties(package_manager PROPERTIES TIMEOUT 60)
     add_test(
+        NAME package_admin_concurrency
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/package_admin_concurrency_test.py"
+                "$<TARGET_FILE:sgs-package-admin>"
+    )
+    set_tests_properties(package_admin_concurrency PROPERTIES TIMEOUT 30)
+    add_test(
         NAME network_integration
         COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/network_integration_test.py"

@@ -24,9 +24,9 @@
 
 `sgs-package-admin install` 用参数数组启动 Git，不拼接 shell 命令。生产只允许不含内嵌凭据的 HTTPS 或 SSH URL；关闭系统/用户 Git 配置、交互提示、仓库 hook 与 `ext` 协议。下载进入状态目录下的独立 staging，随后验证完整小写 commit、根目录 `manifest.json` 原始字节 SHA-256、Schema 等价约束、UTF-8、声明路径与符号链接边界。全部成功后才将 checkout 原子移动到不可变的 `installed/<id>/<commit>`。
 
-注册表记录仓库 URL、commit、Manifest 摘要、相对安装目录和 enabled 状态。写入先落临时文件再 rename；启用操作先计算完整依赖闭包、版本范围、循环、重复 ID、确定性拓扑顺序、RFC 8785 `manifest_id` 和实际 SGS/1 帧长度，验证通过后才替换注册表及内存活动清单。启动或 reload 时会复核 checkout HEAD 和 Manifest 摘要；失败保留旧内存状态。
+注册表记录仓库 URL、commit、Manifest 摘要、相对安装目录和 enabled 状态。每个读取操作取得共享 `flock`，每个变更操作取得排他 `flock`，并在锁内重新读取最新注册表；锁覆盖 Git 下载、验证、候选状态计算和持久化，避免两个管理进程以旧快照互相覆盖。写入使用包含 PID 与进程内原子计数的临时文件，以 `O_EXCL` 创建、fsync 后 rename；启用操作先计算完整依赖闭包、版本范围、循环、重复 ID、确定性拓扑顺序、RFC 8785 `manifest_id` 和实际 SGS/1 帧长度，验证通过后才替换注册表及内存活动清单。启动或 reload 时会复核 checkout HEAD 和 Manifest 摘要；失败保留旧内存状态。
 
-管理程序与网络服务是独立进程。当前 M3-A 不监视注册表文件；外部 CLI 更新在服务端下一次正常启动时生效。若未来把管理入口接入服务进程，必须在工作线程完成 Git/磁盘校验，再回到 Asio 线程调用现有原子切换接口，不得阻塞网络事件循环。
+管理程序与网络服务是独立进程。当前 M3-A 不监视注册表文件；外部 CLI 更新后，正在运行的服务端必须正常重启，才会载入新清单。若未来把管理入口接入服务进程，必须在工作线程完成 Git/磁盘校验，再回到 Asio 线程调用现有原子切换接口，不得阻塞网络事件循环。
 
 ## 清单与 Session 同步生命周期
 
@@ -62,4 +62,4 @@ RoomSnapshot 仅投递当前房间成员。RoomListChanged 只投递已进入大
 
 ## 服务端权威边界与当前限制
 
-未来 Game 模块持有权威对局状态，Room 只组织参与者与对局生命周期，Lua 只承载受控规则执行；客户端只提交意图。M3-A-S 尚未加载包内 Lua/QML、启动游戏、支持私有 Git 凭据、在线热加载、TLS、永久认证、限流、数据库、WebSocket/HTTP 或多线程工作池。包中的游戏规则和表现资源由后续 Package Agent 实现，服务端包管理层不解释其业务含义。
+未来 Game 模块持有权威对局状态，Room 只组织参与者与对局生命周期，Lua 只承载受控规则执行；客户端只提交意图。M3-A-S 尚未加载包内 Lua/QML、启动游戏、支持私有 Git 凭据、在线热加载、TLS、永久认证、限流、数据库、WebSocket/HTTP 或多线程工作池。Git 下载尚无总超时；也未限制仓库字节数、checkout 文件数、单文件大小、staging/installed 总磁盘用量或包数量以外的资源配额。包中的游戏规则和表现资源由后续 Package Agent 实现，服务端包管理层不解释其业务含义。

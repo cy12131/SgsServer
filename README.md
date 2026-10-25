@@ -48,7 +48,11 @@ SGS_PACKAGE_ROOT=/srv/sgs/packages ./build/sgs-package-admin enable org.example.
 SGS_PACKAGE_ROOT=/srv/sgs/packages ./build/sgs-package-admin list
 ```
 
-管理程序只接受公开 `https://` 或 `ssh://` URL，不接受 URL 内嵌凭据。它使用参数数组调用 Git，不经过 shell，并禁用仓库 hook、交互提示及 `ext`/生产 `file` 协议。注册表用临时文件原子替换；安装或启用失败不会替换旧有效配置。当前运行中的服务端不会监视外部管理程序写入，完成管理操作后需在维护窗口正常重启以载入新清单；进程内清单切换接口会立即清除 Ready 并发送变更通知。
+管理程序只接受公开 `https://` 或 `ssh://` URL，不接受 URL 内嵌凭据。它使用参数数组调用 Git，不经过 shell，并禁用仓库 hook、交互提示及 `ext`/生产 `file` 协议。多个管理进程通过 package root 内的跨进程文件锁串行执行完整的“重读—验证—修改—持久化”事务；注册表用进程唯一临时文件原子替换，安装或启用失败不会替换旧有效配置。
+
+**当前运行中的服务端不会监视外部管理程序写入。执行 install/enable/disable/set-enabled 后，必须在维护窗口正常重启服务端，才能载入新清单。** 不要通过杀进程或直接编辑 `registry.json` 代替正常管理和重启。进程内清单切换接口会立即清除 Ready 并发送变更通知，但 M3-A 尚未提供对应的远程管理入口。
+
+当前 Git 子进程尚无总下载超时、仓库大小、checkout 文件数、单文件大小或磁盘配额。只应注册可信且规模受控的公开仓库，并由部署环境提供进程级超时和磁盘监控。
 
 只有显式设置 `SGS_BIND_ADDRESS=0.0.0.0` 才会监听所有 IPv4 网卡。这样做会把未包含认证和加密的 M1 服务暴露给同网段或公网；跨设备联调前应配置防火墙，只开放可信网络，并避免公网直接暴露。
 

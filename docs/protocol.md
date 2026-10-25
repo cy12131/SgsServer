@@ -105,7 +105,7 @@ SGS/1 M1-S 没有 TLS、压缩、认证、登录、房间、游戏消息、重�
 
 ## 9. M2 临时用户与大厅
 
-M2 不改变 `protocol: 1`。客户端完成 Hello 后可发送 EnterLobby：
+本节至第 15 节保留 `v0.3.0-m2` 的历史业务协议定义。M2 当时不改变 `protocol: 1`，客户端完成 Hello 后即可发送 EnterLobby；在当前 M3 服务端上，还必须先完成第 16～18 节的 Package Sync，否则 EnterLobby 返回 `PACKAGE_PROTOCOL_REQUIRED`。
 
 ```json
 {"protocol":1,"type":"EnterLobby","request_id":10,"data":{"nickname":"玩家A"}}
@@ -238,7 +238,7 @@ M2 沿用第 7 节 Error 格式，并增加：
 
 ## 15. M2 限制
 
-M2 临时用户不持久化，没有密码、恢复令牌或跨连接身份恢复；房间不能开始游戏。尚无 Lua、卡牌/技能、数据库、资源包同步、TLS、恶意用户防护体系或复杂订阅系统。
+以下描述只适用于 `v0.3.0-m2` 历史里程碑：临时用户不持久化，没有密码、恢复令牌或跨连接身份恢复；房间不能开始游戏；当时尚无资源包同步。M3 保留这些用户/房间限制，但已由第 16 节起的 Package Sync 替代“无资源包同步”状态。Lua、卡牌/技能、数据库、TLS、恶意用户防护体系或复杂订阅系统仍未实现。
 
 ## 16. M3 Package Sync 状态
 
