@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cardgame/server/lobby/lobby_service.h"
+#include "cardgame/server/package/package_sync_service.h"
 #include "cardgame/server/protocol/message_codec.h"
 
 #include <cstdint>
@@ -17,7 +18,10 @@ struct RouteResult {
 
 class MessageRouter final {
 public:
-    MessageRouter(lobby::LobbyService& lobby_service, std::uint64_t session_id) noexcept;
+    MessageRouter(
+        lobby::LobbyService& lobby_service,
+        package::PackageSyncService& package_sync,
+        std::uint64_t session_id) noexcept;
 
     [[nodiscard]] RouteResult route(const Message& request, bool ready) const;
 
@@ -26,6 +30,7 @@ private:
         std::int32_t request_id, std::string code, std::string text);
 
     lobby::LobbyService& lobby_service_;
+    package::PackageSyncService& package_sync_;
     std::uint64_t session_id_;
 };
 

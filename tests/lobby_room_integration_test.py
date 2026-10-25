@@ -8,6 +8,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -32,6 +33,7 @@ class Client:
         self.connection.settimeout(3)
         self.next_id = 1
         self.name = name
+        self.package_ready = False
 
     def close(self):
         if self.connection is not None:
@@ -69,7 +71,20 @@ class Client:
         })
         return self.expect("HelloAck", request_id)
 
+    def sync_packages(self):
+        request_id = self.send("GetPackageManifest", {})
+        manifest = self.expect("PackageManifestResult", request_id)
+        assert manifest["data"]["packages"] == []
+        request_id = self.send(
+            "PackageReady", {"manifest_id": manifest["data"]["manifest_id"]}
+        )
+        result = self.expect("PackageReadyResult", request_id)
+        assert result["data"] == {"ready": True}
+        self.package_ready = True
+
     def enter(self, nickname):
+        if not self.package_ready:
+            self.sync_packages()
         request_id = self.send("EnterLobby", {"nickname": nickname})
         return self.expect("EnterLobbyResult", request_id)
 
@@ -117,6 +132,7 @@ def run_primary_scenario(port):
         first = owner.enter("同名玩家")
         second = guest.enter("同名玩家")
         watcher_user = watcher.enter("  大厅观察者  ")
+        no_lobby.sync_packages()
         owner_id = first["data"]["user_id"]
         guest_id = second["data"]["user_id"]
         assert owner_id != guest_id
@@ -284,6 +300,7 @@ def run_input_and_seat_scenario(port):
         client = Client(port, "InvalidNickname")
         try:
             client.hello()
+            client.sync_packages()
             request_id = client.send("EnterLobby", {"nickname": nickname})
             client.expect_error(request_id, "INVALID_NICKNAME")
         finally:
@@ -381,32 +398,34 @@ def main():
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
 
-    environment = os.environ.copy()
-    environment["SGS_BIND_ADDRESS"] = "127.0.0.1"
-    environment["SGS_PORT"] = str(port)
-    server = subprocess.Popen(
-        [sys.argv[1]], env=environment, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True,
-    )
-    try:
-        wait_for_server(port)
-        run_primary_scenario(port)
-        run_input_and_seat_scenario(port)
-        run_resource_limit_scenario(port)
-        server.send_signal(signal.SIGTERM)
-        return_code = server.wait(timeout=5)
-        stdout, stderr = server.communicate()
-        assert return_code == 0, (return_code, stdout, stderr)
-        assert "started successfully" in stdout
-        assert "Stopping CardGameServer." in stdout
-    finally:
-        if server.poll() is None:
-            server.terminate()
-            try:
-                server.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                server.kill()
-                server.wait(timeout=2)
+    with tempfile.TemporaryDirectory(prefix="sgs-m2-package-root-") as package_root:
+        environment = os.environ.copy()
+        environment["SGS_BIND_ADDRESS"] = "127.0.0.1"
+        environment["SGS_PORT"] = str(port)
+        environment["SGS_PACKAGE_ROOT"] = package_root
+        server = subprocess.Popen(
+            [sys.argv[1]], env=environment, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            wait_for_server(port)
+            run_primary_scenario(port)
+            run_input_and_seat_scenario(port)
+            run_resource_limit_scenario(port)
+            server.send_signal(signal.SIGTERM)
+            return_code = server.wait(timeout=5)
+            stdout, stderr = server.communicate()
+            assert return_code == 0, (return_code, stdout, stderr)
+            assert "started successfully" in stdout
+            assert "Stopping CardGameServer." in stdout
+        finally:
+            if server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait(timeout=2)
 
 
 if __name__ == "__main__":

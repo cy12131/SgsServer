@@ -76,7 +76,7 @@ DecodeResult MessageCodec::decode_body(std::string_view body) {
     const auto* type_value = object.if_contains("type");
     const auto* request_id_value = object.if_contains("request_id");
     const auto* data_value = object.if_contains("data");
-    if (protocol_value == nullptr || type_value == nullptr ||
+    if (object.size() != 4 || protocol_value == nullptr || type_value == nullptr ||
         request_id_value == nullptr || data_value == nullptr ||
         !protocol_value->is_int64() || !type_value->is_string() ||
         !request_id_value->is_int64() || !data_value->is_object()) {

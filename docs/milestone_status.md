@@ -1,50 +1,55 @@
-# M2-S 里程碑状态报告
+# M3-A-S 里程碑状态报告
 
-状态：**临时用户、大厅、房间和准备状态已实现并通过自动化验收，等待总体架构负责人审核。**
+状态：**服务端资源包管理、确定性清单和 Package Sync v1 已实现；自动化验收结果见下文。**
 
-## 工程与 Git
+## 基线与契约
 
 - 正式目录：`/home/cy/Code/SgsServerRepo`
-- 开发分支：`feature/m2-lobby-room-server`
-- 基线：`v0.2.0-m1` / main 合并提交 `54f4d1f`
-- 技术栈保持 C++20、Boost.Asio、Boost.JSON、CMake 和 CTest
-- 未引入新第三方依赖
+- 开发分支：`feature/m3-a-server-packages`
+- 稳定基线：`v0.3.0-m2`，peeled commit `34efd19e3e6e47e73b6e1accc76276cbcde4564c`
+- 架构契约：SgsArchitecture `5b78b419a98a4fa18d68873444b695960cbfa066`
+- 读取并实现：Package Manifest v1、Package Sync v1、M3 Agent Interface Matrix、对应 Schema、示例、RFC 8785 向量及 ADR-0007/0008
+- 技术栈保持 C++20、CMake、CTest、Boost.Asio/Boost.JSON；新增运行时外部工具仅为现有 Git CLI
 
-## 所有权与模块边界
+## 实现摘要
 
-TcpServer 拥有 LobbyService 和 `session_id → shared_ptr<Session>` 映射。UserManager 中的 User 只保存数值 session_id，不反向持有 Session，因此没有循环 shared_ptr。LobbyService 协调 UserManager 与 RoomManager；MessageRouter 只做消息分发，Session 仍只处理网络生命周期、帧和 FIFO 写队列。
+`PackageManager` 独立于 LobbyService，负责公开 HTTPS/SSH Git 仓库注册、完整 commit 锁定、Manifest 原始字节 SHA-256、Schema 等价校验、API 兼容检查、依赖版本/缺失/循环/重复检测、稳定拓扑顺序、启停事务和注册表持久化。Git 通过 fork/exec 参数数组调用，不经过 shell；禁用仓库 hook、交互提示、用户/系统配置和 `ext` 协议，生产禁用 `file` 协议及 URL 内嵌凭据。
 
-RoomManager 使用按 room_id 排序的房间映射。Room 保存 owner_id、max_players、revision 和按加入顺序排列的 RoomPlayer vector；seat 在 1～max_players 中选择最小空位，现有成员不移动。
+安装先进入同状态目录 staging；下载、checkout 和所有验证成功后才 rename 至 `installed/<id>/<commit>`。注册表使用临时文件加原子 rename。启用先构造并编码完整候选清单，任何依赖、持久化或 65536 字节正文限制错误都不会替换旧有效清单。启动/reload 会重新核对 HEAD、Manifest 与注册摘要。
 
-## 主要执行链
+`manifest_id` 对按包 ID 排序、依赖 ID 排序的 Package Sync 七字段数组执行 RFC 8785 JCS 和 SHA-256。实现通过架构仓库的 RFC 8785 第 3.2.2/3.2.3、空清单及多包摘要向量。`manifest_sha256` 单独表示 commit 中 `manifest.json` 原始字节摘要。
 
-- EnterLobby：Router → LobbyService 校验并规范化昵称 → UserManager 分配运行期唯一 user_id → EnterLobbyResult。
-- CreateRoom：验证身份、名称、容量、单房约束和 100 房限制 → RoomManager 创建 revision=1 的房间并加入房主 → CreateRoomResult → RoomSnapshot → 大厅 RoomListChanged。
-- JoinRoom：验证身份、room_id、存在性、容量和单房约束 → 分配最小空座并增加 revision → JoinRoomResult → 当前成员 RoomSnapshot → 大厅 RoomListChanged。
-- SetReady：验证成员与非房主身份 → 实际状态变化时增加 revision → SetReadyResult → 当前成员 RoomSnapshot。
+`PackageSyncService` 为每个数值 Session ID 保存独立确认摘要。连接默认 NotReady；空清单仍需 PackageReady；断线和清单变化清除确认。GetPackageManifest、PackageReady、PackageReadyResult 和 PackageManifestChanged 保持 SGS/1 四字段信封及原长度帧。EnterLobby/CreateRoom/JoinRoom 增加 `PACKAGE_PROTOCOL_REQUIRED` 门禁，Hello/Ping/Echo 保持兼容。
 
-同一 Session 的 Result 先进入原有异步写队列，再投递通知，保证 FIFO。跨连接不承诺全局到达顺序。
+## 管理与运行
 
-## 断线清理
+新增 `sgs-package-admin`，提供 `list`、`install URL COMMIT`、`enable ID`、`disable ID` 和 `set-enabled ID...`。状态目录由 `SGS_PACKAGE_ROOT` 指定，服务端默认回退到 XDG/HOME state 路径。CLI 与服务端是独立进程；M3-A 不实现文件监视，外部变更需在维护窗口正常重启服务端载入。进程内切换接口会立即使 Session NotReady 并广播 PackageManifestChanged。
 
-Session 关闭时，TcpServer 先调用 LobbyService：若用户在房间则移除成员；房主由加入顺序最早的剩余成员接任且 ready=false；空房删除；随后删除临时用户。变化后的成员收到 RoomSnapshot，大厅用户收到 RoomListChanged。服务停止时执行同样的状态释放，但不广播无意义通知。
+## 自动化验收
 
-## 自动化测试
+可复现命令：
 
-CTest 包含：
+```bash
+cmake -S . -B build-m3-validation -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-m3-validation -j2
+ctest --test-dir build-m3-validation --output-on-failure
+```
 
-1. `application_smoke`：应用标识回归。
-2. `network_integration`：M1 Hello、Ping、中文 Echo、帧、错误、超时与停止回归。
-3. `lobby_room_integration`：真实多客户端 TCP 测试，覆盖重复昵称与唯一 ID、昵称校验、未进大厅拒绝、2/8 人房、列表与通知、加入/满员/重复加入、准备/取消、房主权限、稳定座位、revision、退出/房主转移/空房删除、异常断线、快速交替操作、错误不改状态、客户端 request_id=0 拒绝及 100 房间资源上限。
+测试覆盖：真实本地 Git 仓库安装及 commit 锁定；缺失/非法 Manifest；路径与符号链接边界；下载失败回滚；依赖缺失、版本、循环和重复 ID；确定性加载顺序；注册表重载与摘要复核；架构标准摘要向量；候选清单超限；空清单同步、错误摘要、正确 Ready、变更失效和断线清理；真实 TCP Hello/Ping/Echo、Package Sync 门禁及重连；原 M1/M2 网络与大厅房间回归。
 
-所有 socket 和 CTest 均设置明确超时，不用长时间 sleep 代替同步。
+实测结果：
 
-## 已知限制与未实现范围
+- Debug 配置与 `cmake --build ... -j2` 成功，无编译警告。
+- 正式目录 Debug CTest：5/5 通过；`application_smoke`、`package_manager`、`network_integration`、`lobby_room_integration`、`package_sync_integration` 全部成功，总计约 17.95 秒。
+- ASan + UBSan 独立构建成功；同一组 CTest 5/5 通过，总计约 21.62 秒，未报告 sanitizer 错误。
+- M2 压力回归暴露并修复了 Session 关闭与已完成异步写回调之间的队列生命周期竞态；对应 `lobby_room_integration` 随后连续运行 3 次均通过。
+- 公开仓库负向验证：从 `https://github.com/cy12131/SgsArchitecture.git` 精确 checkout 架构 commit 成功，随后按契约以 `PACKAGE_MANIFEST_MISSING` 拒绝；未生成 `registry.json`，旧配置不受影响。
 
-- 用户和房间仅存在于内存，进程重启后清空。
-- M2 没有身份恢复令牌，重连必须重新 EnterLobby。
-- 房间只有 `waiting`，不能开始游戏。
-- 未实现游戏规则、Lua、卡牌、技能、数据库、永久认证、资源包同步或客户端代码。
-- 尚未进行 M2 Windows/Linux 跨设备联调。
+## 兼容性与已知限制
 
-M2-S 到此停止，不进入游戏逻辑或后续阶段。
+- M2 客户端仍可 Hello/Ping/Echo，但若不实现 Package Sync，EnterLobby 会收到 `PACKAGE_PROTOCOL_REQUIRED`；这是 ADR-0008 规定的有意协议变化。
+- 架构仓库在指定提交中没有提供可直接安装的独立公开合法测试包仓库 URL；合法安装验收使用真实 Git 命令操作的受控本地仓库，生产 URL 规则另有单元校验。公开 SgsArchitecture 仓库可用于验证“根目录缺少 manifest.json”失败路径。
+- 私有仓库凭据、在线注册表监视、资源包热加载、Lua/GameProcessManager、规则/卡牌/技能、Windows 客户端和实际对局不在 M3-A-S 范围。
+- M3-A 不强制驱逐清单变化前已经在房间中的用户；只使其包同步状态失效。对局中的版本隔离与安全热切换留待后续统一设计。
+
+M3-A-S 完成后停止，不合并 main、不创建发布标签、不进入 Lua 或游戏规则阶段。

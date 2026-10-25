@@ -3,6 +3,7 @@
 /build-*/
 /cmake-build-*/
 /out/
+/.sgs-packages/
 
 # 编译器与分析工具生成物
 compile_commands.json

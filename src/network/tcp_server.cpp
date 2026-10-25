@@ -13,12 +13,22 @@
 
 namespace cardgame::server::network {
 
-TcpServer::TcpServer(std::string address, unsigned short port, std::ostream& output)
+TcpServer::TcpServer(
+    std::string address,
+    unsigned short port,
+    std::filesystem::path package_root,
+    std::ostream& output)
     : address_(std::move(address)),
       port_(port),
       output_(output),
       acceptor_(io_context_),
-      signals_(io_context_, SIGINT, SIGTERM) {}
+      signals_(io_context_, SIGINT, SIGTERM),
+      package_manager_({std::move(package_root)}),
+      package_sync_(package_manager_) {
+    package_sync_.set_changed_handler([this](const std::string& manifest_id) {
+        package_manifest_changed(manifest_id);
+    });
+}
 
 TcpServer::~TcpServer() {
     stop();
@@ -51,6 +61,7 @@ void TcpServer::start_accept() {
                     session_id,
                     std::move(socket),
                     lobby_service_,
+                    package_sync_,
                     [this](const std::shared_ptr<Session>& closed) {
                         session_closed(closed);
                     },
@@ -76,10 +87,28 @@ void TcpServer::session_closed(const std::shared_ptr<Session>& session) {
     }
     const std::uint64_t session_id = iterator->first;
     std::vector<lobby::Notification> notifications = lobby_service_.disconnect(session_id);
+    package_sync_.disconnect(session_id);
     sessions_.erase(iterator);
     if (!stopped_) {
         deliver(std::move(notifications));
     }
+}
+
+void TcpServer::package_manifest_changed(const std::string& manifest_id) {
+    protocol::Message notification;
+    notification.type = "PackageManifestChanged";
+    notification.request_id = 0;
+    notification.data = {{"manifest_id", manifest_id}};
+    for (const auto& [session_id, session] : sessions_) {
+        static_cast<void>(session_id);
+        if (session->handshake_completed()) {
+            session->send_notification(notification);
+        }
+    }
+}
+
+package::PackageManager& TcpServer::package_manager() noexcept {
+    return package_manager_;
 }
 
 void TcpServer::deliver(std::vector<lobby::Notification> notifications) {
