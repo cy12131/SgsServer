@@ -18,8 +18,10 @@ RouteResult invalid_message(std::int32_t request_id, std::string text) {
 }  // namespace
 
 MessageRouter::MessageRouter(
-    lobby::LobbyService& lobby_service, std::uint64_t session_id) noexcept
-    : lobby_service_(lobby_service), session_id_(session_id) {}
+    lobby::LobbyService& lobby_service,
+    package::PackageSyncService& package_sync,
+    std::uint64_t session_id) noexcept
+    : lobby_service_(lobby_service), package_sync_(package_sync), session_id_(session_id) {}
 
 Message MessageRouter::error(
     std::int32_t request_id, std::string code, std::string text) {
@@ -79,6 +81,18 @@ RouteResult MessageRouter::route(const Message& request, bool ready) const {
         response.request_id = request.request_id;
         response.data = {{"text", text->as_string()}};
         return {std::move(response), {}, false, false};
+    }
+
+    if (request.type == "GetPackageManifest" || request.type == "PackageReady") {
+        return {package_sync_.handle(session_id_, request), {}, false, false};
+    }
+
+    if ((request.type == "EnterLobby" || request.type == "CreateRoom" ||
+         request.type == "JoinRoom") &&
+        !package_sync_.is_ready(session_id_)) {
+        return {error(request.request_id, "PACKAGE_PROTOCOL_REQUIRED",
+                      "Complete PackageSync/1 before EnterLobby"),
+                {}, false, false};
     }
 
     if (request.type == "EnterLobby" || request.type == "ListRooms" ||

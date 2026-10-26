@@ -8,6 +8,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -179,33 +180,35 @@ def main():
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
 
-    environment = os.environ.copy()
-    environment["SGS_BIND_ADDRESS"] = "127.0.0.1"
-    environment["SGS_PORT"] = str(port)
-    server = subprocess.Popen(
-        [sys.argv[1]],
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        run_tests(port)
-        server.send_signal(signal.SIGTERM)
-        return_code = server.wait(timeout=5.0)
-        stdout, stderr = server.communicate()
-        assert return_code == 0, (return_code, stdout, stderr)
-        assert "CardGameServer 0.1.0-dev" in stdout
-        assert "started successfully" in stdout
-        assert "Stopping CardGameServer." in stdout
-    finally:
-        if server.poll() is None:
-            server.terminate()
-            try:
-                server.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                server.kill()
-                server.wait(timeout=2.0)
+    with tempfile.TemporaryDirectory(prefix="sgs-m1-package-root-") as package_root:
+        environment = os.environ.copy()
+        environment["SGS_BIND_ADDRESS"] = "127.0.0.1"
+        environment["SGS_PORT"] = str(port)
+        environment["SGS_PACKAGE_ROOT"] = package_root
+        server = subprocess.Popen(
+            [sys.argv[1]],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            run_tests(port)
+            server.send_signal(signal.SIGTERM)
+            return_code = server.wait(timeout=5.0)
+            stdout, stderr = server.communicate()
+            assert return_code == 0, (return_code, stdout, stderr)
+            assert "CardGameServer 0.1.0-dev" in stdout
+            assert "started successfully" in stdout
+            assert "Stopping CardGameServer." in stdout
+        finally:
+            if server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait(timeout=2.0)
 
 
 if __name__ == "__main__":

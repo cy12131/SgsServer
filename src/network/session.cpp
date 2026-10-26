@@ -15,13 +15,14 @@ Session::Session(
     std::uint64_t session_id,
     boost::asio::ip::tcp::socket socket,
     lobby::LobbyService& lobby_service,
+    package::PackageSyncService& package_sync,
     CloseHandler on_close,
     DeliveryHandler deliver)
     : socket_(std::move(socket)),
       handshake_timer_(socket_.get_executor()),
       on_close_(std::move(on_close)),
       deliver_(std::move(deliver)),
-      router_(lobby_service, session_id) {}
+      router_(lobby_service, package_sync, session_id) {}
 
 void Session::start() {
     start_handshake_timer();
@@ -104,6 +105,10 @@ void Session::send_notification(protocol::Message message) {
     send(std::move(message), false);
 }
 
+bool Session::handshake_completed() const noexcept {
+    return ready_;
+}
+
 void Session::send(protocol::Message message, bool close_after) {
     try {
         const bool write_in_progress = !writes_.empty();
@@ -131,6 +136,11 @@ void Session::write_next() {
                 self->close();
                 return;
             }
+            // close() 会立即清空队列；取消中的 async_write 仍可能以成功完成回调。
+            // 此时不能再访问 front()，Session 已经没有待发送数据。
+            if (self->closed_ || self->writes_.empty()) {
+                return;
+            }
             const bool close_after = self->writes_.front().close_after;
             self->writes_.pop_front();
             if (close_after) {
@@ -150,7 +160,8 @@ void Session::close() {
     handshake_timer_.cancel();
     socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored);
     socket_.close(ignored);
-    writes_.clear();
+    // writes_ 也是进行中 async_write 的缓冲区所有者。这里不能提前清空；
+    // 完成回调持有 self，回调返回并释放 Session 时再安全销毁队列。
     if (on_close_) {
         on_close_(shared_from_this());
         on_close_ = {};

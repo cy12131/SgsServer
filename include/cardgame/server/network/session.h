@@ -23,12 +23,14 @@ public:
         std::uint64_t session_id,
         boost::asio::ip::tcp::socket socket,
         lobby::LobbyService& lobby_service,
+        package::PackageSyncService& package_sync,
         CloseHandler on_close,
         DeliveryHandler deliver);
 
     void start();
     void close();
     void send_notification(protocol::Message message);
+    [[nodiscard]] bool handshake_completed() const noexcept;
 
 private:
     struct PendingWrite {

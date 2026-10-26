@@ -5,10 +5,12 @@
 #include <charconv>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <ostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace cardgame::server {
 
@@ -38,9 +40,23 @@ int Application::run() {
         port = static_cast<unsigned short>(parsed_port);
     }
 
+    std::filesystem::path package_root;
+    if (const char* configured = std::getenv("SGS_PACKAGE_ROOT");
+        configured != nullptr && *configured != '\0') {
+        package_root = configured;
+    } else if (const char* state_home = std::getenv("XDG_STATE_HOME");
+               state_home != nullptr && *state_home != '\0') {
+        package_root = std::filesystem::path{state_home} / "sgs-server" / "packages";
+    } else if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+        package_root = std::filesystem::path{home} / ".local" / "state" /
+                       "sgs-server" / "packages";
+    } else {
+        package_root = ".sgs-packages";
+    }
+
     try {
         output_ << name << ' ' << version << '\n';
-        network::TcpServer server{address, port, output_};
+        network::TcpServer server{address, port, std::move(package_root), output_};
         server.run();
         return 0;
     } catch (const std::exception& exception) {

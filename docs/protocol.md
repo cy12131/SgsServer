@@ -105,7 +105,7 @@ SGS/1 M1-S 没有 TLS、压缩、认证、登录、房间、游戏消息、重�
 
 ## 9. M2 临时用户与大厅
 
-M2 不改变 `protocol: 1`。客户端完成 Hello 后可发送 EnterLobby：
+本节至第 15 节保留 `v0.3.0-m2` 的历史业务协议定义。M2 当时不改变 `protocol: 1`，客户端完成 Hello 后即可发送 EnterLobby；在当前 M3 服务端上，还必须先完成第 16～18 节的 Package Sync，否则 EnterLobby 返回 `PACKAGE_PROTOCOL_REQUIRED`。
 
 ```json
 {"protocol":1,"type":"EnterLobby","request_id":10,"data":{"nickname":"玩家A"}}
@@ -238,4 +238,107 @@ M2 沿用第 7 节 Error 格式，并增加：
 
 ## 15. M2 限制
 
-M2 临时用户不持久化，没有密码、恢复令牌或跨连接身份恢复；房间不能开始游戏。尚无 Lua、卡牌/技能、数据库、资源包同步、TLS、恶意用户防护体系或复杂订阅系统。
+以下描述只适用于 `v0.3.0-m2` 历史里程碑：临时用户不持久化，没有密码、恢复令牌或跨连接身份恢复；房间不能开始游戏；当时尚无资源包同步。M3 保留这些用户/房间限制，但已由第 16 节起的 Package Sync 替代“无资源包同步”状态。Lua、卡牌/技能、数据库、TLS、恶意用户防护体系或复杂订阅系统仍未实现。
+
+## 16. M3 Package Sync 状态
+
+Package Sync v1 只增加 SGS/1 消息类型，不改变第 1～2 节的帧和公共信封。Hello 完成后，每条新 TCP Session 的包状态仍是 **NotReady**。Hello、Ping、Echo 不受影响；客户端必须在 EnterLobby 前依次完成：
+
+```text
+GetPackageManifest → PackageManifestResult → PackageReady → PackageReadyResult
+```
+
+即使 `packages` 为空也必须显式确认。只有 `PackageReady.manifest_id` 等于服务端当前清单时才进入包 Ready；断线或清单改变会清除此状态。NotReady 时 EnterLobby、CreateRoom、JoinRoom 返回 `PACKAGE_PROTOCOL_REQUIRED` 且默认不关闭 TCP。已进入房间的身份和房间数据不会因 M3-A 清单变化而被强制迁移，实际对局热切换尚未实现。
+
+## 17. GetPackageManifest / PackageManifestResult
+
+请求的 `known_manifest_id` 可省略；存在时必须是 64 位小写 SHA-256：
+
+```json
+{"protocol":1,"type":"GetPackageManifest","request_id":21,"data":{}}
+```
+
+服务端始终返回完整有序清单：
+
+```json
+{
+  "protocol": 1,
+  "type": "PackageManifestResult",
+  "request_id": 21,
+  "data": {
+    "manifest_id": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "packages": [],
+    "sync_timeout_ms": 30000
+  }
+}
+```
+
+非空 `packages` 的每一项严格且仅包含：
+
+```json
+{
+  "id": "org.sgs.base",
+  "version": "1.0.0",
+  "api_version": "1.0",
+  "repository_url": "https://github.com/example/base.git",
+  "commit": "1111111111111111111111111111111111111111",
+  "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "dependencies": []
+}
+```
+
+`commit` 是完整 40 位 SHA-1 或 64 位 SHA-256 小写 Git 对象 ID；`manifest_sha256` 是该 commit 根目录 `manifest.json` 原始字节 SHA-256。SGS TCP 不传输仓库内容，客户端直接使用清单 URL。
+
+`manifest_id` 的输入只包含 packages 数组：包按 ASCII `id` 升序，每项 dependencies 也按 ASCII ID 升序，然后按 RFC 8785 规范化 JSON 并计算 SHA-256。不包含信封、manifest_id、超时或本地状态。空数组 `[]` 的固定摘要如上。完整 `PackageManifestResult` 必须放入单个正文不超过 65536 字节的 SGS/1 帧，不分页、不截断。
+
+## 18. PackageReady / PackageReadyResult
+
+客户端完成下载、commit/Manifest/依赖验证及原子活动集合切换后发送：
+
+```json
+{"protocol":1,"type":"PackageReady","request_id":22,"data":{"manifest_id":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"}}
+```
+
+成功响应：
+
+```json
+{"protocol":1,"type":"PackageReadyResult","request_id":22,"data":{"ready":true}}
+```
+
+摘要不匹配时保持 NotReady，失败使用 PackageReadyResult 的内嵌错误，不使用标准 Error 信封：
+
+```json
+{
+  "protocol": 1,
+  "type": "PackageReadyResult",
+  "request_id": 22,
+  "data": {
+    "ready": false,
+    "error": {
+      "code": "MANIFEST_ID_MISMATCH",
+      "message": "Client package manifest does not match the current server requirement",
+      "retryable": true
+    }
+  }
+}
+```
+
+## 19. PackageManifestChanged 通知
+
+活动清单改变后，服务端先使所有 Session 的旧 Ready 失效，再向已完成 Hello 的连接发送：
+
+```json
+{"protocol":1,"type":"PackageManifestChanged","request_id":0,"data":{"manifest_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+```
+
+客户端应取消旧同步事务，重新 GetPackageManifest 并只提交新摘要。通知不携带包详情。
+
+## 20. M3 错误与限制
+
+| 位置 / code | 条件 |
+| --- | --- |
+| 标准 `Error` / `PACKAGE_PROTOCOL_REQUIRED` | 当前 Session 尚未确认活动清单却请求 EnterLobby/CreateRoom/JoinRoom |
+| `PackageReadyResult.error` / `MANIFEST_ID_MISMATCH` | 客户端确认摘要不是当前活动摘要 |
+| 管理接口 / `PACKAGE_MANIFEST_TOO_LARGE` | 候选 PackageManifestResult 的实际 UTF-8 JSON 正文超过 65536 字节；旧清单保持有效 |
+
+Package Sync 字段多余、缺失或类型非法返回 `INVALID_MESSAGE`。M3-A 不定义资源包上传、服务端下载代理、私有仓库凭据、分页、Lua 加载、游戏消息或热切换协议，也不把包版本绑定进 Hello。

@@ -24,6 +24,10 @@ add_library(cardgame_server_core STATIC
     src/lobby/user_manager.cpp
     src/network/session.cpp
     src/network/tcp_server.cpp
+    src/package/package_manager.cpp
+    src/package/package_manifest.cpp
+    src/package/package_sync_service.cpp
+    src/package/package_utils.cpp
     src/protocol/message_codec.cpp
     src/protocol/message_router.cpp
 )
@@ -42,6 +46,12 @@ add_executable(cardgame-server
 target_link_libraries(cardgame-server PRIVATE cardgame_server_core)
 cardgame_enable_warnings(cardgame-server)
 
+add_executable(sgs-package-admin
+    src/package_admin.cpp
+)
+target_link_libraries(sgs-package-admin PRIVATE cardgame_server_core)
+cardgame_enable_warnings(sgs-package-admin)
+
 include(CTest)
 if(BUILD_TESTING)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -52,7 +62,22 @@ if(BUILD_TESTING)
     target_link_libraries(cardgame-smoke-test PRIVATE cardgame_server_core)
     cardgame_enable_warnings(cardgame-smoke-test)
 
+    add_executable(cardgame-package-test
+        tests/package_manager_test.cpp
+    )
+    target_link_libraries(cardgame-package-test PRIVATE cardgame_server_core)
+    cardgame_enable_warnings(cardgame-package-test)
+
     add_test(NAME application_smoke COMMAND cardgame-smoke-test)
+    add_test(NAME package_manager COMMAND cardgame-package-test)
+    set_tests_properties(package_manager PROPERTIES TIMEOUT 60)
+    add_test(
+        NAME package_admin_concurrency
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/package_admin_concurrency_test.py"
+                "$<TARGET_FILE:sgs-package-admin>"
+    )
+    set_tests_properties(package_admin_concurrency PROPERTIES TIMEOUT 30)
     add_test(
         NAME network_integration
         COMMAND "${Python3_EXECUTABLE}"
@@ -68,4 +93,12 @@ if(BUILD_TESTING)
                 "$<TARGET_FILE:cardgame-server>"
     )
     set_tests_properties(lobby_room_integration PROPERTIES TIMEOUT 45)
+
+    add_test(
+        NAME package_sync_integration
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/package_sync_integration_test.py"
+                "$<TARGET_FILE:cardgame-server>"
+    )
+    set_tests_properties(package_sync_integration PROPERTIES TIMEOUT 30)
 endif()
