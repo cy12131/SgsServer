@@ -1,8 +1,62 @@
-# M3-A-S 里程碑状态报告
+# M3-B1 里程碑状态报告
 
-状态：**服务端资源包管理、确定性清单和 Package Sync v1 已实现；自动化验收结果见下文。**
+状态：**独立游戏进程监管与 GameIPC/1 通信基础已实现；M3-A 能力保持并通过回归。**
 
-## 基线与契约
+## M3-B1 基线与实现
+
+- 正式目录：`/home/cy/Code/SgsServerRepo`
+- 开发分支：`feature/m3-b1-game-ipc`
+- 稳定基线：`v0.4.0-m3a`，commit `8e3b941e24f995f2f4ef1efe8b60bfe0fb134662`
+- 架构契约：SgsArchitecture `ca3e9bab9084050945051b181de5cea55413f9d7`
+- `GameIpcCodec` 严格处理 GameIPC/1 帧、九种消息、方向、Schema 等价字段、重复 key、UTF-8 和独立双向 sequence。
+- `GameProcessManager` 通过显式 argv 和非阻塞匿名管道启动每游戏一个子进程，冻结游戏/房间/清单/包/座位身份，实施 4 MiB/256 帧背压、初始化超时及 Shutdown→SIGTERM→SIGKILL 异步回收。
+- 测试子进程不接触 Session、LobbyService 或 RoomManager；B1 不执行 Lua，也不接入房间开始流程。
+
+详细内部接口、生命周期和 B2 对接点见 `docs/game_ipc.md`。
+
+## M3-B1 自动化验收
+
+隔离构建命令：
+
+```bash
+cmake -S . -B /tmp/sgs-m3b1-debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build /tmp/sgs-m3b1-debug -j2
+ctest --test-dir /tmp/sgs-m3b1-debug --output-on-failure
+
+cmake -S . -B /tmp/sgs-m3b1-sanitize -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS=-fsanitize=address,undefined \
+  -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined
+cmake --build /tmp/sgs-m3b1-sanitize -j2
+ctest --test-dir /tmp/sgs-m3b1-sanitize --output-on-failure
+```
+
+- Debug CTest：8/8 通过，总计 19.69 秒。
+- ASan + UBSan CTest：8/8 通过，总计 19.62 秒，未报告 sanitizer 错误。
+- `game_ipc` 使用与 SgsArchitecture 固定提交内容逐字节一致的 InitGame/GameReady 标准向量，并覆盖九种消息、方向、非法 JSON/UTF-8/重复 key、未知字段、1 MiB 边界、分片/连续帧和 sequence 重复/跳号/上限/回绕。
+- `game_process_manager` 覆盖正常与崩溃退出、管道关闭、绑定错误、初始化超时、事件循环响应性、字节/帧背压、重复停止、SIGTERM→SIGKILL、并发子进程、FD 继承、描述符泄漏和 zombie 回收。
+- `network_integration`、`lobby_room_integration`、`package_manager`、`package_admin_concurrency` 与 `package_sync_integration` 全部通过，证明 M1/M2/M3-A 回归正常。
+
+## M3-B1 第二轮专项审计
+
+审计继续以 SgsArchitecture `ca3e9bab9084050945051b181de5cea55413f9d7` 为准；复核时该提交仍为架构仓库最新 `origin/main`。发现并修复：管理器析构后排队异步回调可能访问失效 `this`；活动子进程的析构兜底只执行一次 `WNOHANG`、可能留下 zombie；Runtime 在未发送终态时以 0 退出可能被误判为成功；codec 的可选 `any` 方向扩大接受域；InitGame seed 被错误缩窄为 uint64 而非 Schema 规定的 1～20 位十进制字符串。
+
+回归测试新增完整 1 MiB 正边界、截断帧、倒退/重复 sequence、子进程两端管道提前关闭、未终态零退出、真实默认 4 MiB/256 帧背压、管理器带待处理回调析构、退出回调中析构以及子进程兜底回收。进程监管专项测试连续运行 50 次全部通过，结束后没有测试子进程或 zombie 残留。最终完整 Debug 与 ASan/UBSan 结果记录在本次修订提交中。
+
+- 第二轮最终 Debug CTest：8/8 通过，总计 19.95 秒。
+- 第二轮最终 ASan + UBSan CTest：8/8 通过，总计 27.62 秒，未报告 sanitizer 错误。
+- 正式架构仓库的 InitGame/GameReady 向量与纳入仓库的测试数据 SHA-256 分别一致；完整架构 Python 验证器的临时依赖安装受当前 SOCKS/直连网络限制，未把该外部工具结果冒充为服务端测试结果。
+
+## M3-B1 最终生命周期复核
+
+原子布尔令牌只能降低排队回调在析构后的访问概率，不能阻止“回调检查通过后，另一线程完成析构”的 check-to-use 竞态。最终实现将全部异步状态移入引用计数的内部 State，read/write/timer/reap 回调持有 State 而不捕获管理器裸 `this`；退出回调中立即销毁 facade 后，当前回调仍持有 State 并安全返回。该结论依赖项目当前单 `io_context::run()` 线程约束；若未来启用多个执行线程，必须先用 strand 或等价同步串行化 State。
+
+B1 stub 不输出日志，当前 FD 1/2 仍继承父进程，因此正式 Runtime 高频或敏感输出可能阻塞子进程、污染终端/journal 或泄露私有信息。B2 接入真实 Lua Runtime 前必须加入独立、有界、持续排空的异步日志通道；日志 sink 满时丢弃并合并统计，而不是停止读取或无限缓存。
+
+- 最终复核 Debug CTest：8/8 通过，总计 20.01 秒。
+- 最终复核 ASan + UBSan CTest：8/8 通过，总计 27.71 秒，未报告 sanitizer 错误。
+- 未重复第二轮的 50 次压力测试；本轮直接相关的 `game_process_manager` 在 Debug/ASan+UBSan 中分别通过，并覆盖待处理操作析构、消息回调内析构与退出回调内析构。
+
+## M3-A 历史基线与契约
 
 - 正式目录：`/home/cy/Code/SgsServerRepo`
 - 开发分支：`feature/m3-a-server-packages`
@@ -53,4 +107,4 @@ ctest --test-dir build-m3-validation --output-on-failure
 - Git 下载尚无总超时；仓库大小、checkout 文件数、单文件大小、临时目录与安装目录总磁盘用量等资源配额尚未实现。部署时只应使用可信、规模受控的仓库并提供外部监控。
 - M3-A 不强制驱逐清单变化前已经在房间中的用户；只使其包同步状态失效。对局中的版本隔离与安全热切换留待后续统一设计。
 
-M3-A-S 完成后停止，不合并 main、不创建发布标签、不进入 Lua 或游戏规则阶段。
+M3-B1 完成后只提交并推送 feature 分支，不合并 main、不创建发布标签。正式 Lua Runtime、房间开始游戏、请求 deadline、玩家视图路由和进程资源沙箱留待 B2～B4。

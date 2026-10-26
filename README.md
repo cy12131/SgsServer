@@ -1,8 +1,8 @@
 # SgsServer
 
-SgsServer 是独立开发的 Linux 多人在线回合制卡牌游戏服务端。M3-A-S 在既有 SGS/1、临时用户、大厅与房间能力上增加了资源包安装、校验、确定性清单和逐连接同步门禁，不依赖 FreeKill。
+SgsServer 是独立开发的 Linux 多人在线回合制卡牌游戏服务端。M3-B1 在既有 SGS/1、大厅房间与资源包同步能力上，增加了独立游戏子进程监管和严格 GameIPC/1 通信基础，不依赖 FreeKill。
 
-当前能力包括 SGS/1 长度前缀帧、Hello/Ping/Echo、M2 大厅与房间，以及 Package Manifest v1 / Package Sync v1。服务端可从公开 HTTPS/SSH Git 仓库锁定完整 commit，严格校验 `manifest.json`、依赖图和 64 KiB 清单帧，并原子持久化注册表。尚未实现永久账号、游戏规则、Lua、数据库、私有仓库凭据或资源包热加载。
+当前能力包括 SGS/1 长度前缀帧、Hello/Ping/Echo、M2 大厅与房间、Package Manifest v1 / Package Sync v1，以及 GameIPC/1 编解码、双向 sequence、非阻塞管道、背压和子进程异步回收。服务端可从公开 HTTPS/SSH Git 仓库锁定完整 commit 并原子持久化注册表。GameProcessManager 目前是独立基础组件，尚未接入房间开始流程，也未实现正式 Lua Runtime、永久账号、数据库、私有仓库凭据或资源包热加载。
 
 ## 依赖
 
@@ -22,7 +22,7 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
 
-CTest 包含资源包单元/真实 Git 夹具、M1/M2 回归和 Package Sync 真实 TCP 测试，所有测试均有明确超时。Release 构建可将 `CMAKE_BUILD_TYPE` 改为 `Release`。
+CTest 包含 GameIPC 编解码与进程监管、资源包单元/真实 Git 夹具、M1/M2 回归和 Package Sync 真实 TCP 测试，所有测试均有明确超时。Release 构建可将 `CMAKE_BUILD_TYPE` 改为 `Release`。
 
 ## 启动配置
 
@@ -62,4 +62,4 @@ SGS_PACKAGE_ROOT=/srv/sgs/packages ./build/sgs-package-admin list
 
 同机环境连接 `127.0.0.1:18765`。跨设备时，服务端显式监听局域网地址或 `0.0.0.0`，Windows 客户端连接 Linux 主机的局域网 IPv4 地址与配置端口。连接后必须在 10 秒内按 [SGS/1 协议](docs/protocol.md)发送 Hello，再完成 GetPackageManifest / PackageReady；即使服务器清单为空也不能跳过。之后才可 EnterLobby。旧 M2 客户端仍可 Hello/Ping/Echo，但 EnterLobby 会得到 `PACKAGE_PROTOCOL_REQUIRED`。TCP 字节流必须实现 4 字节大端长度头，不能假设一次读取就是一条完整消息。
 
-架构与生命周期见 [docs/architecture.md](docs/architecture.md)，验收状态见 [docs/milestone_status.md](docs/milestone_status.md)。
+架构与生命周期见 [docs/architecture.md](docs/architecture.md)，GameIPC/1 内部接口见 [docs/game_ipc.md](docs/game_ipc.md)，验收状态见 [docs/milestone_status.md](docs/milestone_status.md)。
