@@ -1,0 +1,19 @@
+{
+  "ipc_version": "1",
+  "type": "InitGame",
+  "game_id": "game-0001",
+  "sequence": "1",
+  "request_token": "init_A1b2C3d4E5f6",
+  "payload": {
+    "room_id": "1",
+    "manifest_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "mode_id": "standard",
+    "seed": "424242",
+    "players": [
+      { "player_id": "player-a", "seat": 1, "display_name": "Player A" },
+      { "player_id": "player-b", "seat": 2, "display_name": "Player B" }
+    ],
+    "packages": [{ "id": "org.sgs.base", "commit": "1111111111111111111111111111111111111111" }],
+    "settings": {}
+  }
+}

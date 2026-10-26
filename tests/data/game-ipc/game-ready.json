@@ -1,0 +1,12 @@
+{
+  "ipc_version": "1",
+  "type": "GameReady",
+  "game_id": "game-0001",
+  "sequence": "1",
+  "request_token": "init_A1b2C3d4E5f6",
+  "payload": {
+    "mode_id": "standard",
+    "runtime_api_version": "1.0-draft",
+    "loaded_packages": [{ "id": "org.sgs.base", "commit": "1111111111111111111111111111111111111111" }]
+  }
+}

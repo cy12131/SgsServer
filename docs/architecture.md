@@ -1,4 +1,4 @@
-# 服务端架构说明（M3-A-S）
+# 服务端架构说明（M3-B1）
 
 ## 进程入口与所有权
 
@@ -16,9 +16,17 @@
 - **RoomManager**：持有 Room、稳定座位、加入顺序、准备状态和 revision，实现创建、加入、退出、房主转移与空房删除。
 - **LobbyService**：验证 M2-P 业务字段，协调 UserManager 与 RoomManager，并生成 Result 和定向通知列表。
 
-游戏、Lua、永久认证和数据库均不属于这些类，也未在 M2-S 创建占位抽象。
+GameIPC 与游戏子进程不属于上述网络业务类；Lua、永久认证和数据库同样不属于这些类。
 
 资源包管理不写入 LobbyService，也不改变 Hello 内容。PackageManager 的输出通过 PackageSyncService 暴露给路由；LobbyService 只在路由确认当前 Session 已同步后才接收 EnterLobby/CreateRoom/JoinRoom。客户端直接从清单中的仓库获取资源，服务端不充当下载代理。
+
+## 独立游戏进程与 GameIPC 边界
+
+`GameProcessManager` 是未接入 TcpServer/RoomManager 的独立核心组件。它按活动游戏拥有一个子进程和两条单向非阻塞匿名管道，启动时冻结 game_id、room_id、manifest_id、有序 packages、mode、roster/seats 及 child identity。子进程不持有 Session、socket 或大厅对象，不能直接发送 SGS/1 或修改房间状态。
+
+`GameIpcCodec` 与 SGS/1 MessageCodec 完全分离，严格实现 GameIPC/1 的 4 字节大端长度、1 MiB 正文上限、九种消息、方向及 Schema 等价验证。父→子和子→父 sequence 各自从 1 连续递增。GameReady 必须回显启动绑定；来自子进程的 token、recipient 和 roster 关联信息由父进程再次校验。IPC 有效只表示传输契约有效，不代表动作获得业务授权。
+
+父端描述符接入同一个 Boost.Asio 事件循环，读取、写入、waitpid 检测与停止升级均异步执行。写队列默认限制为 4 MiB 或 256 帧，越界只终止异常游戏。停止路径依次发送 Shutdown、SIGTERM、SIGKILL，并在 waitpid 成功后恰好回调一次。Runtime CLI/FD 契约、Lua 沙箱、只读 generation、资源限制及游戏视图路由留给 B2～B4。
 
 ## 资源包安装与事务边界
 
@@ -62,4 +70,4 @@ RoomSnapshot 仅投递当前房间成员。RoomListChanged 只投递已进入大
 
 ## 服务端权威边界与当前限制
 
-未来 Game 模块持有权威对局状态，Room 只组织参与者与对局生命周期，Lua 只承载受控规则执行；客户端只提交意图。M3-A-S 尚未加载包内 Lua/QML、启动游戏、支持私有 Git 凭据、在线热加载、TLS、永久认证、限流、数据库、WebSocket/HTTP 或多线程工作池。Git 下载尚无总超时；也未限制仓库字节数、checkout 文件数、单文件大小、staging/installed 总磁盘用量或包数量以外的资源配额。包中的游戏规则和表现资源由后续 Package Agent 实现，服务端包管理层不解释其业务含义。
+未来 Game Runtime 持有权威对局状态，Room 只组织参与者与对局生命周期，Lua 只承载受控规则执行；客户端只提交意图。M3-B1 尚未把进程管理接入房间、加载包内 Lua/QML、实现正式 Runtime API、限制子进程 CPU/内存/文件系统，或提供游戏视图路由。私有 Git 凭据、在线热加载、TLS、永久认证、限流、数据库、WebSocket/HTTP 和多线程工作池也未实现。Git 下载尚无总超时；也未限制仓库字节数、checkout 文件数、单文件大小、staging/installed 总磁盘用量或包数量以外的资源配额。

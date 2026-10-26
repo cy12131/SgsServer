@@ -1,8 +1,42 @@
-# M3-A-S 里程碑状态报告
+# M3-B1 里程碑状态报告
 
-状态：**服务端资源包管理、确定性清单和 Package Sync v1 已实现；自动化验收结果见下文。**
+状态：**独立游戏进程监管与 GameIPC/1 通信基础已实现；M3-A 能力保持并通过回归。**
 
-## 基线与契约
+## M3-B1 基线与实现
+
+- 正式目录：`/home/cy/Code/SgsServerRepo`
+- 开发分支：`feature/m3-b1-game-ipc`
+- 稳定基线：`v0.4.0-m3a`，commit `8e3b941e24f995f2f4ef1efe8b60bfe0fb134662`
+- 架构契约：SgsArchitecture `ca3e9bab9084050945051b181de5cea55413f9d7`
+- `GameIpcCodec` 严格处理 GameIPC/1 帧、九种消息、方向、Schema 等价字段、重复 key、UTF-8 和独立双向 sequence。
+- `GameProcessManager` 通过显式 argv 和非阻塞匿名管道启动每游戏一个子进程，冻结游戏/房间/清单/包/座位身份，实施 4 MiB/256 帧背压、初始化超时及 Shutdown→SIGTERM→SIGKILL 异步回收。
+- 测试子进程不接触 Session、LobbyService 或 RoomManager；B1 不执行 Lua，也不接入房间开始流程。
+
+详细内部接口、生命周期和 B2 对接点见 `docs/game_ipc.md`。
+
+## M3-B1 自动化验收
+
+隔离构建命令：
+
+```bash
+cmake -S . -B /tmp/sgs-m3b1-debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build /tmp/sgs-m3b1-debug -j2
+ctest --test-dir /tmp/sgs-m3b1-debug --output-on-failure
+
+cmake -S . -B /tmp/sgs-m3b1-sanitize -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS=-fsanitize=address,undefined \
+  -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined
+cmake --build /tmp/sgs-m3b1-sanitize -j2
+ctest --test-dir /tmp/sgs-m3b1-sanitize --output-on-failure
+```
+
+- Debug CTest：8/8 通过，总计 19.69 秒。
+- ASan + UBSan CTest：8/8 通过，总计 19.62 秒，未报告 sanitizer 错误。
+- `game_ipc` 使用与 SgsArchitecture 固定提交内容逐字节一致的 InitGame/GameReady 标准向量，并覆盖九种消息、方向、非法 JSON/UTF-8/重复 key、未知字段、1 MiB 边界、分片/连续帧和 sequence 重复/跳号/上限/回绕。
+- `game_process_manager` 覆盖正常与崩溃退出、管道关闭、绑定错误、初始化超时、事件循环响应性、字节/帧背压、重复停止、SIGTERM→SIGKILL、并发子进程、FD 继承、描述符泄漏和 zombie 回收。
+- `network_integration`、`lobby_room_integration`、`package_manager`、`package_admin_concurrency` 与 `package_sync_integration` 全部通过，证明 M1/M2/M3-A 回归正常。
+
+## M3-A 历史基线与契约
 
 - 正式目录：`/home/cy/Code/SgsServerRepo`
 - 开发分支：`feature/m3-a-server-packages`
@@ -53,4 +87,4 @@ ctest --test-dir build-m3-validation --output-on-failure
 - Git 下载尚无总超时；仓库大小、checkout 文件数、单文件大小、临时目录与安装目录总磁盘用量等资源配额尚未实现。部署时只应使用可信、规模受控的仓库并提供外部监控。
 - M3-A 不强制驱逐清单变化前已经在房间中的用户；只使其包同步状态失效。对局中的版本隔离与安全热切换留待后续统一设计。
 
-M3-A-S 完成后停止，不合并 main、不创建发布标签、不进入 Lua 或游戏规则阶段。
+M3-B1 完成后只提交并推送 feature 分支，不合并 main、不创建发布标签。正式 Lua Runtime、房间开始游戏、请求 deadline、玩家视图路由和进程资源沙箱留待 B2～B4。
