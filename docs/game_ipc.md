@@ -31,7 +31,9 @@ B1 内部 Runtime CLI 采用 Implementation Candidate：
 
 进程退出由短周期异步 timer 调用 `waitpid(..., WNOHANG)` 检测，网络事件循环不会阻塞等待。正常停止先排队 Shutdown；宽限期后发送 SIGTERM，再超时才发送 SIGKILL。初始化超时、非法协议、管道关闭、非零退出、信号退出和 exec 失败均清理 descriptor/timer，并且退出回调和 reap 只执行一次。PID 在 waitpid 回收前不会被其他进程复用，因此信号只发送给当前记录的子进程。
 
-管理器析构会先使回调生命周期令牌失效，再取消描述符和 timer；因此已排队的完成回调不会访问已销毁的管理器。若析构时仍有活动子进程，兜底路径发送 SIGKILL，并由只等待该 PID 的独立 reaper 回收，避免阻塞 Asio 线程或留下 zombie。正常运行仍应优先调用异步停止流程，而不是依赖析构兜底。
+异步操作所需的 map、进程状态和辅助方法位于引用计数的内部 `State`；每个 read/write/timer/reap 回调直接持有 `shared_ptr<State>`，不捕获 `GameProcessManager` 裸指针。管理器析构只执行幂等 shutdown；已排队回调中的 State 会存活到回调返回，并在看到 shutting_down 后停止递归排队。若析构时仍有活动子进程，兜底路径发送 SIGKILL，并由只等待该 PID 的独立 reaper 回收，避免阻塞 Asio 线程或留下 zombie。正常运行仍应优先调用异步停止流程，而不是依赖析构兜底。
+
+当前服务端只有一个 `io_context::run()` 线程；GameProcessManager 的公共方法、析构和内部 State 变化必须在该线程串行执行。引用计数解决对象生命周期，不把 State 变成线程安全容器。未来若启用多线程 `io_context`，接入前必须用 strand 或等价同步覆盖所有公共调用和回调。
 
 ## 当前安全边界与后续接口
 
@@ -40,6 +42,7 @@ B1 内部 Runtime CLI 采用 Implementation Candidate：
 - IPC 成功只代表传输和外层 Schema 有效，不代表动作合法或规则安全。
 - `GameProcessManager` 当前作为独立核心组件构建和测试，尚未由 TcpServer/RoomManager 创建真实对局。
 - B2 需要提供受限 Lua Runtime、只读 generation、最终 CLI/FD 协议、stdout/stderr 限流净化，以及包入口加载和真实 GameReady。
+- B1 stub 不写 stdout/stderr；当前子进程仍继承父进程的 FD 1/2。B2 启动真实 Runtime 前必须改为独立异步日志通道：持续排空，单条截断，按局限流，敏感字段净化，并使用有界 sink 队列。队列满时丢弃新日志并累计一次摘要，不能停止读取管道或无限扩张内存。
 - B3/B4 仍需完成 Request token 状态表与 deadline、正式 Lua 事件/协程桥接、定向视图路由、CPU/内存/FD/文件系统限制和失败日志净化。
 
 测试使用专用 `cardgame-game-process-stub`，覆盖合法 Init/GameReady、分片读写、非法 JSON/类型/长度/sequence、绑定不一致、初始化超时、崩溃、EOF、字节/帧背压、重复停止、SIGTERM→SIGKILL、多个并发子进程、FD 继承和 zombie 检查。该 stub 不是 Lua Runtime，也不随生产服务启动。

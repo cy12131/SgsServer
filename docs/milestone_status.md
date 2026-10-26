@@ -46,6 +46,16 @@ ctest --test-dir /tmp/sgs-m3b1-sanitize --output-on-failure
 - 第二轮最终 ASan + UBSan CTest：8/8 通过，总计 27.62 秒，未报告 sanitizer 错误。
 - 正式架构仓库的 InitGame/GameReady 向量与纳入仓库的测试数据 SHA-256 分别一致；完整架构 Python 验证器的临时依赖安装受当前 SOCKS/直连网络限制，未把该外部工具结果冒充为服务端测试结果。
 
+## M3-B1 最终生命周期复核
+
+原子布尔令牌只能降低排队回调在析构后的访问概率，不能阻止“回调检查通过后，另一线程完成析构”的 check-to-use 竞态。最终实现将全部异步状态移入引用计数的内部 State，read/write/timer/reap 回调持有 State 而不捕获管理器裸 `this`；退出回调中立即销毁 facade 后，当前回调仍持有 State 并安全返回。该结论依赖项目当前单 `io_context::run()` 线程约束；若未来启用多个执行线程，必须先用 strand 或等价同步串行化 State。
+
+B1 stub 不输出日志，当前 FD 1/2 仍继承父进程，因此正式 Runtime 高频或敏感输出可能阻塞子进程、污染终端/journal 或泄露私有信息。B2 接入真实 Lua Runtime 前必须加入独立、有界、持续排空的异步日志通道；日志 sink 满时丢弃并合并统计，而不是停止读取或无限缓存。
+
+- 最终复核 Debug CTest：8/8 通过，总计 20.01 秒。
+- 最终复核 ASan + UBSan CTest：8/8 通过，总计 27.71 秒，未报告 sanitizer 错误。
+- 未重复第二轮的 50 次压力测试；本轮直接相关的 `game_process_manager` 在 Debug/ASan+UBSan 中分别通过，并覆盖待处理操作析构、消息回调内析构与退出回调内析构。
+
 ## M3-A 历史基线与契约
 
 - 正式目录：`/home/cy/Code/SgsServerRepo`

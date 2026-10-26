@@ -201,16 +201,61 @@ struct GameProcessManager::Process {
     std::unordered_set<std::string> child_request_tokens;
 };
 
+struct GameProcessManager::State final
+    : std::enable_shared_from_this<GameProcessManager::State> {
+    explicit State(boost::asio::io_context& io_context_value)
+        : io_context{io_context_value} {}
+
+    pid_t start(
+        GameLaunchRecord launch,
+        GameProcessOptions options,
+        MessageHandler message_handler,
+        ExitHandler exit_handler);
+    void send(
+        std::string_view game_id,
+        std::string type,
+        boost::json::object payload,
+        std::optional<std::string> request_token);
+    void request_stop(std::string_view game_id, std::string reason);
+    void request_stop_all(std::string reason);
+    [[nodiscard]] std::optional<GameProcessSnapshot> snapshot(
+        std::string_view game_id) const;
+    [[nodiscard]] std::size_t active_count() const noexcept;
+    void shutdown() noexcept;
+
+    void begin_read(const std::shared_ptr<Process>& process);
+    void handle_body(const std::shared_ptr<Process>& process, std::string_view body);
+    void enqueue(const std::shared_ptr<Process>& process, GameIpcMessage message);
+    void begin_write(const std::shared_ptr<Process>& process);
+    void schedule_reap(const std::shared_ptr<Process>& process);
+    void reap(const std::shared_ptr<Process>& process, int wait_status);
+    void fail_process(const std::shared_ptr<Process>& process, std::string code);
+    void begin_termination(const std::shared_ptr<Process>& process);
+    void close_descriptors(const std::shared_ptr<Process>& process);
+
+    boost::asio::io_context& io_context;
+    bool shutting_down = false;
+    std::unordered_map<std::string, std::shared_ptr<Process>> processes;
+    std::unordered_set<std::string> used_game_ids;
+};
+
 GameProcessManager::GameProcessManager(boost::asio::io_context& io_context)
-    : io_context_{io_context} {
+    : state_{std::make_shared<State>(io_context)} {
     // 管道对端关闭时 write(2) 可能产生 SIGPIPE。忽略该信号后，Asio 会以
     // broken_pipe 回调，进而只终止目标游戏进程而不是整个服务端。
     std::signal(SIGPIPE, SIG_IGN);
 }
 
 GameProcessManager::~GameProcessManager() {
-    callback_lifetime_->store(false, std::memory_order_release);
-    for (auto& [game_id, process] : processes_) {
+    state_->shutdown();
+}
+
+void GameProcessManager::State::shutdown() noexcept {
+    if (shutting_down) {
+        return;
+    }
+    shutting_down = true;
+    for (auto& [game_id, process] : processes) {
         static_cast<void>(game_id);
         close_descriptors(process);
         process->initialization_timer.cancel();
@@ -222,14 +267,18 @@ GameProcessManager::~GameProcessManager() {
             reap_after_manager_destruction(process->pid);
         }
     }
+    processes.clear();
 }
 
-pid_t GameProcessManager::start(
+pid_t GameProcessManager::State::start(
     GameLaunchRecord launch,
     GameProcessOptions options,
     MessageHandler message_handler,
     ExitHandler exit_handler) {
-    if (used_game_ids_.contains(launch.game_id)) {
+    if (shutting_down) {
+        throw std::logic_error{"game process manager is shutting down"};
+    }
+    if (used_game_ids.contains(launch.game_id)) {
         throw std::invalid_argument{"game_id cannot be reused in one server process"};
     }
     if (!options.executable.is_absolute() || ::access(options.executable.c_str(), X_OK) != 0) {
@@ -245,7 +294,7 @@ pid_t GameProcessManager::start(
     }
 
     auto process = std::make_shared<Process>(
-        io_context_, std::move(launch), std::move(options),
+        io_context, std::move(launch), std::move(options),
         std::move(message_handler), std::move(exit_handler));
 
     // fork 前先完成所有可能分配内存的 argv/env 构造。子进程只调用
@@ -316,19 +365,19 @@ pid_t GameProcessManager::start(
     process->state = GameProcessState::initializing;
     process->read_pipe.assign(child_to_parent[0]);
     process->write_pipe.assign(parent_to_child[1]);
-    processes_.emplace(process->launch.game_id, process);
-    used_game_ids_.insert(process->launch.game_id);
+    processes.emplace(process->launch.game_id, process);
+    used_game_ids.insert(process->launch.game_id);
 
     begin_read(process);
     schedule_reap(process);
     process->initialization_timer.expires_after(process->options.initialization_timeout);
-    const auto initialization_lifetime = callback_lifetime_;
-    process->initialization_timer.async_wait([this, process, initialization_lifetime](const boost::system::error_code& error) {
-        if (!initialization_lifetime->load(std::memory_order_acquire)) {
+    const auto initialization_state = shared_from_this();
+    process->initialization_timer.async_wait([initialization_state, process](const boost::system::error_code& error) {
+        if (initialization_state->shutting_down) {
             return;
         }
         if (!error && process->state == GameProcessState::initializing) {
-            fail_process(process, "IPC_INITIALIZATION_TIMEOUT");
+            initialization_state->fail_process(process, "IPC_INITIALIZATION_TIMEOUT");
         }
     });
 
@@ -350,13 +399,13 @@ pid_t GameProcessManager::start(
     return child;
 }
 
-void GameProcessManager::send(
+void GameProcessManager::State::send(
     std::string_view game_id,
     std::string type,
     boost::json::object payload,
     std::optional<std::string> request_token) {
-    const auto found = processes_.find(std::string{game_id});
-    if (found == processes_.end() || found->second->state != GameProcessState::running) {
+    const auto found = processes.find(std::string{game_id});
+    if (found == processes.end() || found->second->state != GameProcessState::running) {
         throw std::invalid_argument{"game process is not running"};
     }
     GameIpcMessage message;
@@ -368,9 +417,9 @@ void GameProcessManager::send(
     enqueue(found->second, std::move(message));
 }
 
-void GameProcessManager::request_stop(std::string_view game_id, std::string reason) {
-    const auto found = processes_.find(std::string{game_id});
-    if (found == processes_.end()) {
+void GameProcessManager::State::request_stop(std::string_view game_id, std::string reason) {
+    const auto found = processes.find(std::string{game_id});
+    if (found == processes.end()) {
         return;
     }
     const std::shared_ptr<Process>& process = found->second;
@@ -390,24 +439,24 @@ void GameProcessManager::request_stop(std::string_view game_id, std::string reas
     }
     process->state = GameProcessState::finishing;
     process->shutdown_timer.expires_after(process->options.shutdown_grace);
-    const auto shutdown_lifetime = callback_lifetime_;
-    process->shutdown_timer.async_wait([this, process, shutdown_lifetime](const boost::system::error_code& error) {
-        if (!shutdown_lifetime->load(std::memory_order_acquire)) {
+    const auto shutdown_state = shared_from_this();
+    process->shutdown_timer.async_wait([shutdown_state, process](const boost::system::error_code& error) {
+        if (shutdown_state->shutting_down) {
             return;
         }
         if (!error && process->state != GameProcessState::reaped) {
             if (!process->failure_code.has_value()) {
                 process->failure_code = "IPC_SHUTDOWN_TIMEOUT";
             }
-            begin_termination(process);
+            shutdown_state->begin_termination(process);
         }
     });
 }
 
-void GameProcessManager::request_stop_all(std::string reason) {
+void GameProcessManager::State::request_stop_all(std::string reason) {
     std::vector<std::string> ids;
-    ids.reserve(processes_.size());
-    for (const auto& [game_id, process] : processes_) {
+    ids.reserve(processes.size());
+    for (const auto& [game_id, process] : processes) {
         static_cast<void>(process);
         ids.push_back(game_id);
     }
@@ -416,10 +465,10 @@ void GameProcessManager::request_stop_all(std::string reason) {
     }
 }
 
-std::optional<GameProcessSnapshot> GameProcessManager::snapshot(
+std::optional<GameProcessSnapshot> GameProcessManager::State::snapshot(
     std::string_view game_id) const {
-    const auto found = processes_.find(std::string{game_id});
-    if (found == processes_.end()) {
+    const auto found = processes.find(std::string{game_id});
+    if (found == processes.end()) {
         return std::nullopt;
     }
     const Process& process = *found->second;
@@ -428,23 +477,23 @@ std::optional<GameProcessSnapshot> GameProcessManager::snapshot(
         process.queued_bytes, process.writes.size(), process.failure_code};
 }
 
-std::size_t GameProcessManager::active_count() const noexcept {
-    return processes_.size();
+std::size_t GameProcessManager::State::active_count() const noexcept {
+    return processes.size();
 }
 
-void GameProcessManager::begin_read(const std::shared_ptr<Process>& process) {
-    const auto lifetime = callback_lifetime_;
+void GameProcessManager::State::begin_read(const std::shared_ptr<Process>& process) {
+    const auto state = shared_from_this();
     process->read_pipe.async_read_some(
         boost::asio::buffer(process->read_buffer),
-        [this, process, lifetime](const boost::system::error_code& error, std::size_t count) {
-            if (!lifetime->load(std::memory_order_acquire)) {
+        [state, process](const boost::system::error_code& error, std::size_t count) {
+            if (state->shutting_down) {
                 return;
             }
             if (error) {
                 if (error != boost::asio::error::operation_aborted &&
                     process->state != GameProcessState::reaped &&
                     !process->stop_requested) {
-                    fail_process(process, "IPC_PIPE_CLOSED");
+                    state->fail_process(process, "IPC_PIPE_CLOSED");
                 }
                 return;
             }
@@ -452,23 +501,23 @@ void GameProcessManager::begin_read(const std::shared_ptr<Process>& process) {
                 const auto bodies = process->frame_decoder.feed(
                     std::span<const std::uint8_t>{process->read_buffer.data(), count});
                 for (const std::string& body : bodies) {
-                    handle_body(process, body);
-                    if (!lifetime->load(std::memory_order_acquire) ||
+                    state->handle_body(process, body);
+                    if (state->shutting_down ||
                         process->failure_code.has_value()) {
                         return;
                     }
                 }
             } catch (const GameIpcError& exception) {
-                fail_process(process, exception.code);
+                state->fail_process(process, exception.code);
                 return;
             }
-            if (lifetime->load(std::memory_order_acquire)) {
-                begin_read(process);
+            if (!state->shutting_down) {
+                state->begin_read(process);
             }
         });
 }
 
-void GameProcessManager::handle_body(
+void GameProcessManager::State::handle_body(
     const std::shared_ptr<Process>& process,
     std::string_view body) {
     GameIpcMessage message = GameIpcCodec::decode_body(
@@ -520,7 +569,7 @@ void GameProcessManager::handle_body(
     }
 }
 
-void GameProcessManager::enqueue(
+void GameProcessManager::State::enqueue(
     const std::shared_ptr<Process>& process,
     GameIpcMessage message) {
     std::vector<std::uint8_t> frame;
@@ -543,39 +592,39 @@ void GameProcessManager::enqueue(
     begin_write(process);
 }
 
-void GameProcessManager::begin_write(const std::shared_ptr<Process>& process) {
+void GameProcessManager::State::begin_write(const std::shared_ptr<Process>& process) {
     if (process->write_in_progress || process->writes.empty() ||
         process->descriptors_closed) {
         return;
     }
     process->write_in_progress = true;
-    const auto lifetime = callback_lifetime_;
+    const auto state = shared_from_this();
     boost::asio::async_write(
         process->write_pipe,
         boost::asio::buffer(process->writes.front()),
-        [this, process, lifetime](const boost::system::error_code& error, std::size_t) {
-            if (!lifetime->load(std::memory_order_acquire)) {
+        [state, process](const boost::system::error_code& error, std::size_t) {
+            if (state->shutting_down) {
                 return;
             }
             process->write_in_progress = false;
             if (error) {
                 if (error != boost::asio::error::operation_aborted &&
                     process->state != GameProcessState::reaped) {
-                    fail_process(process, "IPC_PIPE_CLOSED");
+                    state->fail_process(process, "IPC_PIPE_CLOSED");
                 }
                 return;
             }
             process->queued_bytes -= process->writes.front().size();
             process->writes.pop_front();
-            begin_write(process);
+            state->begin_write(process);
         });
 }
 
-void GameProcessManager::schedule_reap(const std::shared_ptr<Process>& process) {
+void GameProcessManager::State::schedule_reap(const std::shared_ptr<Process>& process) {
     process->reap_timer.expires_after(std::chrono::milliseconds{10});
-    const auto lifetime = callback_lifetime_;
-    process->reap_timer.async_wait([this, process, lifetime](const boost::system::error_code& error) {
-        if (!lifetime->load(std::memory_order_acquire)) {
+    const auto state = shared_from_this();
+    process->reap_timer.async_wait([state, process](const boost::system::error_code& error) {
+        if (state->shutting_down) {
             return;
         }
         if (error || process->state == GameProcessState::reaped) {
@@ -584,17 +633,17 @@ void GameProcessManager::schedule_reap(const std::shared_ptr<Process>& process) 
         int status = 0;
         const pid_t result = ::waitpid(process->pid, &status, WNOHANG);
         if (result == process->pid) {
-            reap(process, status);
+            state->reap(process, status);
         } else if (result == 0 || (result < 0 && errno == EINTR)) {
-            schedule_reap(process);
+            state->schedule_reap(process);
         } else if (result < 0 && errno != ECHILD) {
-            fail_process(process, "IPC_REAP_FAILED");
-            schedule_reap(process);
+            state->fail_process(process, "IPC_REAP_FAILED");
+            state->schedule_reap(process);
         }
     });
 }
 
-void GameProcessManager::reap(
+void GameProcessManager::State::reap(
     const std::shared_ptr<Process>& process,
     int wait_status) {
     if (process->exit_reported) {
@@ -629,13 +678,13 @@ void GameProcessManager::reap(
     result.expected = result.exited && result.exit_code == 0 &&
                       !result.failure_code.has_value();
 
-    processes_.erase(process->launch.game_id);
+    processes.erase(process->launch.game_id);
     if (process->exit_handler) {
         process->exit_handler(result);
     }
 }
 
-void GameProcessManager::fail_process(
+void GameProcessManager::State::fail_process(
     const std::shared_ptr<Process>& process,
     std::string code) {
     if (process->state == GameProcessState::reaped ||
@@ -650,7 +699,7 @@ void GameProcessManager::fail_process(
     begin_termination(process);
 }
 
-void GameProcessManager::begin_termination(
+void GameProcessManager::State::begin_termination(
     const std::shared_ptr<Process>& process) {
     if (process->state == GameProcessState::reaped) {
         return;
@@ -668,7 +717,7 @@ void GameProcessManager::begin_termination(
     });
 }
 
-void GameProcessManager::close_descriptors(
+void GameProcessManager::State::close_descriptors(
     const std::shared_ptr<Process>& process) {
     if (process->descriptors_closed) {
         return;
@@ -679,6 +728,42 @@ void GameProcessManager::close_descriptors(
     process->read_pipe.close(ignored);
     process->write_pipe.cancel(ignored);
     process->write_pipe.close(ignored);
+}
+
+pid_t GameProcessManager::start(
+    GameLaunchRecord launch,
+    GameProcessOptions options,
+    MessageHandler message_handler,
+    ExitHandler exit_handler) {
+    return state_->start(
+        std::move(launch), std::move(options),
+        std::move(message_handler), std::move(exit_handler));
+}
+
+void GameProcessManager::send(
+    std::string_view game_id,
+    std::string type,
+    boost::json::object payload,
+    std::optional<std::string> request_token) {
+    state_->send(game_id, std::move(type), std::move(payload),
+                 std::move(request_token));
+}
+
+void GameProcessManager::request_stop(std::string_view game_id, std::string reason) {
+    state_->request_stop(game_id, std::move(reason));
+}
+
+void GameProcessManager::request_stop_all(std::string reason) {
+    state_->request_stop_all(std::move(reason));
+}
+
+std::optional<GameProcessSnapshot> GameProcessManager::snapshot(
+    std::string_view game_id) const {
+    return state_->snapshot(game_id);
+}
+
+std::size_t GameProcessManager::active_count() const noexcept {
+    return state_->active_count();
 }
 
 }  // namespace cardgame::server::game

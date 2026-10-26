@@ -480,6 +480,34 @@ void test_manager_destruction_from_exit_callback(
             "manager destruction caused duplicate or missing exit notification");
 }
 
+void test_manager_destruction_from_message_callback(
+    const std::filesystem::path& executable,
+    const std::filesystem::path& root) {
+    boost::asio::io_context io;
+    auto manager = std::make_unique<GameProcessManager>(io);
+    int messages = 0;
+    const pid_t child = manager->start(
+        launch(root / "destroy-in-message", "game-destroy-in-message"),
+        options(executable, root, "normal"),
+        [&](const GameLaunchRecord&, const GameIpcMessage&) {
+            ++messages;
+            manager.reset();
+        },
+        [](const GameProcessExit&) {});
+
+    io.run();
+
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::filesystem::exists("/proc/" + std::to_string(child)) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(2ms);
+    }
+    require(messages == 1 && manager == nullptr,
+            "message callback did not destroy the manager exactly once");
+    require(!std::filesystem::exists("/proc/" + std::to_string(child)),
+            "message callback destruction left a child or zombie behind");
+}
+
 std::size_t descriptor_count() {
     return static_cast<std::size_t>(std::distance(
         std::filesystem::directory_iterator{"/proc/self/fd"},
@@ -504,6 +532,7 @@ int main(int argc, char** argv) {
         test_event_loop_remains_responsive(executable, temporary.path());
         test_manager_destruction_with_pending_callbacks(executable, temporary.path());
         test_manager_destruction_from_exit_callback(executable, temporary.path());
+        test_manager_destruction_from_message_callback(executable, temporary.path());
         const std::size_t descriptors_after = descriptor_count();
         require(descriptors_after <= descriptors_before + 1,
                 "game process tests leaked file descriptors");

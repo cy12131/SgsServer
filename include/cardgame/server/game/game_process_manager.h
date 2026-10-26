@@ -5,7 +5,6 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/json/object.hpp>
 
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -129,26 +128,12 @@ public:
 
 private:
     struct Process;
+    struct State;
 
-    void begin_read(const std::shared_ptr<Process>& process);
-    void handle_body(const std::shared_ptr<Process>& process, std::string_view body);
-    void enqueue(const std::shared_ptr<Process>& process, GameIpcMessage message);
-    void begin_write(const std::shared_ptr<Process>& process);
-    void schedule_reap(const std::shared_ptr<Process>& process);
-    void reap(const std::shared_ptr<Process>& process, int wait_status);
-    void fail_process(
-        const std::shared_ptr<Process>& process,
-        std::string code);
-    void begin_termination(const std::shared_ptr<Process>& process);
-    void close_descriptors(const std::shared_ptr<Process>& process);
-
-    boost::asio::io_context& io_context_;
-    // 异步回调先检查此令牌，避免管理器析构后再访问裸 this。
-    // GameProcessManager 仍按服务端现有单线程事件模型调用。
-    std::shared_ptr<std::atomic_bool> callback_lifetime_ =
-        std::make_shared<std::atomic_bool>(true);
-    std::unordered_map<std::string, std::shared_ptr<Process>> processes_;
-    std::unordered_set<std::string> used_game_ids_;
+    // 所有异步回调持有 State，而不是捕获 GameProcessManager 的裸 this。
+    // 公共方法与析构仍须由同一 io_context 线程串行调用；若未来让
+    // io_context 多线程运行，必须在 State 外再引入 strand 或等价同步。
+    std::shared_ptr<State> state_;
 };
 
 }  // namespace cardgame::server::game
