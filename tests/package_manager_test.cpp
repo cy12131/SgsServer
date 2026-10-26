@@ -3,6 +3,7 @@
 #include "cardgame/server/package/package_utils.h"
 
 #include <boost/json/parse.hpp>
+#include <boost/json/serialize.hpp>
 
 #include <array>
 #include <cerrno>
@@ -35,6 +36,20 @@ void write_file(const std::filesystem::path& path, std::string_view content) {
     if (!output) {
         throw std::runtime_error{"cannot write fixture: " + path.string()};
     }
+}
+
+std::string read_file(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+}
+
+void replace_registry_directory(
+    const std::filesystem::path& registry,
+    std::string directory) {
+    boost::json::value parsed = boost::json::parse(read_file(registry));
+    parsed.as_object().at("packages").as_array().front().as_object()["directory"] =
+        std::move(directory);
+    write_file(registry, boost::json::serialize(parsed));
 }
 
 std::string run(const std::vector<std::string>& arguments) {
@@ -268,6 +283,117 @@ void test_invalid_installations(const std::filesystem::path& root) {
             "failed installs changed valid configuration");
 }
 
+void test_checkout_integrity(const std::filesystem::path& root) {
+    const auto run_case = [&](std::string_view case_name, auto&& pollute) {
+        const std::filesystem::path case_root = root / std::string{case_name};
+        const std::filesystem::path repo = case_root / "repo";
+        std::string commit = create_repository(
+            case_root, "repo", manifest("org.sgs." + std::string{case_name}));
+        if (case_name == "ignored") {
+            write_file(repo / ".gitignore", "*.cache\n");
+            run({"git", "-C", repo.string(), "add", ".gitignore"});
+            run({"git", "-C", repo.string(), "commit", "-m", "ignore fixture"});
+            commit = run({"git", "-C", repo.string(), "rev-parse", "HEAD"});
+        }
+
+        const std::filesystem::path state = case_root / "state";
+        PackageManager manager{options(state)};
+        const auto& installed = manager.install(file_url(repo), commit);
+        const std::filesystem::path checkout = installed.directory;
+        const std::string package_id = installed.manifest.id;
+        const std::string expected_manifest = manager.enable(package_id).manifest_id;
+        const std::string registry_before = read_file(state / "registry.json");
+
+        pollute(checkout);
+        expect_error("PACKAGE_CHECKOUT_DIRTY", [&] { manager.reload_registry(); });
+        require(manager.active_manifest().manifest_id == expected_manifest,
+                "dirty checkout changed the running in-memory generation");
+        require(read_file(state / "registry.json") == registry_before,
+                "dirty checkout validation changed registry.json");
+    };
+
+    run_case("tracked", [](const std::filesystem::path& checkout) {
+        write_file(checkout / "server/init.lua", "return { dirty = true }\n");
+    });
+    run_case("staged", [](const std::filesystem::path& checkout) {
+        write_file(checkout / "server/init.lua", "return { staged = true }\n");
+        run({"git", "-C", checkout.string(), "add", "server/init.lua"});
+    });
+    run_case("untracked", [](const std::filesystem::path& checkout) {
+        write_file(checkout / "assets/untracked.txt", "untracked\n");
+    });
+    run_case("ignored", [](const std::filesystem::path& checkout) {
+        write_file(checkout / "assets/generated.cache", "ignored but unsafe\n");
+    });
+}
+
+void test_canonical_registry_directories(const std::filesystem::path& root) {
+    {
+        const std::filesystem::path case_root = root / "canonical";
+        const std::filesystem::path repo = case_root / "repo";
+        const std::string commit = create_repository(
+            case_root, "repo", manifest("org.sgs.canonical"));
+        const std::filesystem::path state = case_root / "state";
+        PackageManager manager{options(state)};
+        const auto& installed = manager.install(file_url(repo), commit);
+        require(installed.directory ==
+                    state / "installed" / "org.sgs.canonical" / commit,
+                "legal install did not use <package-id>/<commit>");
+        static_cast<void>(manager.enable("org.sgs.canonical"));
+        PackageManager reloaded{options(state)};
+        require(reloaded.active_manifest().packages.size() == 1,
+                "legal canonical package did not reload");
+
+        const std::string generation = manager.active_manifest().manifest_id;
+        replace_registry_directory(state / "registry.json", "legacy-flat");
+        expect_error("INVALID_PACKAGE_REGISTRY", [&] { manager.reload_registry(); });
+        require(manager.active_manifest().manifest_id == generation,
+                "non-canonical registry path changed the running generation");
+    }
+
+    {
+        const std::filesystem::path case_root = root / "directory-symlink";
+        const std::filesystem::path repo = case_root / "repo";
+        const std::string commit = create_repository(
+            case_root, "repo", manifest("org.sgs.directory_symlink"));
+        const std::filesystem::path state = case_root / "state";
+        PackageManager manager{options(state)};
+        const auto& installed = manager.install(file_url(repo), commit);
+        const std::filesystem::path checkout = installed.directory;
+        const std::string package_id = installed.manifest.id;
+        static_cast<void>(manager.enable(package_id));
+        const std::string generation = manager.active_manifest().manifest_id;
+        const std::filesystem::path outside = case_root / "outside-checkout";
+        std::filesystem::rename(checkout, outside);
+        std::filesystem::create_directory_symlink(outside, checkout);
+
+        expect_error("INVALID_PACKAGE_REGISTRY", [&] { manager.reload_registry(); });
+        require(manager.active_manifest().manifest_id == generation,
+                "symlink escape changed the running generation");
+    }
+}
+
+void test_manifest_symlink_rejected(const std::filesystem::path& root) {
+    const std::filesystem::path case_root = root / "manifest-symlink";
+    const std::filesystem::path repo = case_root / "repo";
+    static_cast<void>(create_repository(
+        case_root, "repo", manifest("org.sgs.manifest_symlink")));
+    const std::string manifest_bytes = read_file(repo / "manifest.json");
+    write_file(repo / "real-manifest.json", manifest_bytes);
+    std::filesystem::remove(repo / "manifest.json");
+    std::filesystem::create_symlink("real-manifest.json", repo / "manifest.json");
+    run({"git", "-C", repo.string(), "add", "-A"});
+    run({"git", "-C", repo.string(), "commit", "-m", "symlink manifest"});
+    const std::string commit = run({"git", "-C", repo.string(), "rev-parse", "HEAD"});
+
+    PackageManager manager{options(case_root / "state")};
+    expect_error("INVALID_PACKAGE_MANIFEST", [&] {
+        static_cast<void>(manager.install(file_url(repo), commit));
+    });
+    require(manager.installed().empty(),
+            "manifest symlink failure registered a package");
+}
+
 void test_dependencies(const std::filesystem::path& root) {
     {
         PackageManager manager{options(root / "ordered-state")};
@@ -395,6 +521,9 @@ int main() {
         test_vectors();
         test_install_and_persistence(root);
         test_invalid_installations(root);
+        test_checkout_integrity(root);
+        test_canonical_registry_directories(root);
+        test_manifest_symlink_rejected(root);
         test_dependencies(root);
         test_frame_limit_and_sync_state(root);
         std::filesystem::remove_all(root);

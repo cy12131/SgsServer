@@ -32,7 +32,9 @@ GameIPC 与游戏子进程不属于上述网络业务类；Lua、永久认证和
 
 `sgs-package-admin install` 用参数数组启动 Git，不拼接 shell 命令。生产只允许不含内嵌凭据的 HTTPS 或 SSH URL；关闭系统/用户 Git 配置、交互提示、仓库 hook 与 `ext` 协议。下载进入状态目录下的独立 staging，随后验证完整小写 commit、根目录 `manifest.json` 原始字节 SHA-256、Schema 等价约束、UTF-8、声明路径与符号链接边界。全部成功后才将 checkout 原子移动到不可变的 `installed/<id>/<commit>`。
 
-注册表记录仓库 URL、commit、Manifest 摘要、相对安装目录和 enabled 状态。每个读取操作取得共享 `flock`，每个变更操作取得排他 `flock`，并在锁内重新读取最新注册表；锁覆盖 Git 下载、验证、候选状态计算和持久化，避免两个管理进程以旧快照互相覆盖。写入使用包含 PID 与进程内原子计数的临时文件，以 `O_EXCL` 创建、fsync 后 rename；启用操作先计算完整依赖闭包、版本范围、循环、重复 ID、确定性拓扑顺序、RFC 8785 `manifest_id` 和实际 SGS/1 帧长度，验证通过后才替换注册表及内存活动清单。启动或 reload 时会复核 checkout HEAD 和 Manifest 摘要；失败保留旧内存状态。
+注册表记录仓库 URL、commit、Manifest 摘要、相对安装目录和 enabled 状态。每个读取操作取得共享 `flock`，每个变更操作取得排他 `flock`，并在锁内重新读取最新注册表；锁覆盖 Git 下载、验证、候选状态计算和持久化，避免两个管理进程以旧快照互相覆盖。写入使用包含 PID 与进程内原子计数的临时文件，以 `O_EXCL` 创建、fsync 后 rename；启用操作先计算完整依赖闭包、版本范围、循环、重复 ID、确定性拓扑顺序、RFC 8785 `manifest_id` 和实际 SGS/1 帧长度，验证通过后才替换注册表及内存活动清单。启动或 reload 时会复核 checkout HEAD、index/worktree（包括未跟踪及 ignored 业务文件）、Manifest 摘要和 `installed/<id>/<commit>` canonical 归属；失败保留旧内存状态。`manifest.json` 必须是包根内的普通非符号链接文件，并以 `O_NOFOLLOW` 打开。
+
+这些校验假定资源包状态根只由遵守 `.registry.lock` 的管理工具和服务进程维护，可拒绝安装失败、磁盘污染及重启加载时的非规范目录；它们不构成对拥有同等本机文件写权限攻击者的完整文件系统沙箱。检查与后续使用之间仍可能被该类进程竞争修改，正式 Runtime 还需以只读 generation、受限文件系统权限和 owner package root 解析进一步收紧边界。
 
 管理程序与网络服务是独立进程。当前 M3-A 不监视注册表文件；外部 CLI 更新后，正在运行的服务端必须正常重启，才会载入新清单。若未来把管理入口接入服务进程，必须在工作线程完成 Git/磁盘校验，再回到 Asio 线程调用现有原子切换接口，不得阻塞网络事件循环。
 
