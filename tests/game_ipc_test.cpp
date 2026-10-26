@@ -141,37 +141,45 @@ void test_all_message_types() {
 
 void test_rejections() {
     expect_error("IPC_FRAME_INVALID", [] {
-        static_cast<void>(GameIpcCodec::decode_body(""));
-    });
-    expect_error("IPC_JSON_INVALID", [] {
-        static_cast<void>(GameIpcCodec::decode_body("{not-json"));
+        static_cast<void>(GameIpcCodec::decode_body(
+            "", GameIpcDirection::parent_to_child));
     });
     expect_error("IPC_JSON_INVALID", [] {
         static_cast<void>(GameIpcCodec::decode_body(
-            "{\"ipc_version\":\"1\",\"ipc_version\":\"1\",\"type\":\"Shutdown\",\"game_id\":\"game-test-0001\",\"sequence\":\"1\",\"payload\":{\"reason\":\"x\"}}"));
+            "{not-json", GameIpcDirection::parent_to_child));
+    });
+    expect_error("IPC_JSON_INVALID", [] {
+        static_cast<void>(GameIpcCodec::decode_body(
+            "{\"ipc_version\":\"1\",\"ipc_version\":\"1\",\"type\":\"Shutdown\",\"game_id\":\"game-test-0001\",\"sequence\":\"1\",\"payload\":{\"reason\":\"x\"}}",
+            GameIpcDirection::parent_to_child));
     });
     std::string invalid_utf8 =
         "{\"ipc_version\":\"1\",\"type\":\"Shutdown\",\"game_id\":\"game-test-0001\",\"sequence\":\"1\",\"payload\":{\"reason\":\"";
     invalid_utf8.push_back(static_cast<char>(0xFF));
     invalid_utf8 += "\"}}";
     expect_error("IPC_JSON_INVALID", [&] {
-        static_cast<void>(GameIpcCodec::decode_body(invalid_utf8));
+        static_cast<void>(GameIpcCodec::decode_body(
+            invalid_utf8, GameIpcDirection::parent_to_child));
     });
     expect_error("IPC_MESSAGE_TYPE_INVALID", [] {
         static_cast<void>(GameIpcCodec::decode_body(
-            "{\"ipc_version\":\"1\",\"type\":\"TenthMessage\",\"game_id\":\"game-test-0001\",\"sequence\":\"1\",\"payload\":{}}"));
+            "{\"ipc_version\":\"1\",\"type\":\"TenthMessage\",\"game_id\":\"game-test-0001\",\"sequence\":\"1\",\"payload\":{}}",
+            GameIpcDirection::parent_to_child));
     });
     expect_error("IPC_SCHEMA_INVALID", [] {
         static_cast<void>(GameIpcCodec::decode_body(
-            "{\"ipc_version\":\"1\",\"type\":\"Shutdown\",\"game_id\":\"game-test-0001\",\"sequence\":\"1\",\"payload\":{\"reason\":\"x\"},\"extra\":true}"));
+            "{\"ipc_version\":\"1\",\"type\":\"Shutdown\",\"game_id\":\"game-test-0001\",\"sequence\":\"1\",\"payload\":{\"reason\":\"x\"},\"extra\":true}",
+            GameIpcDirection::parent_to_child));
     });
     expect_error("IPC_SCHEMA_INVALID", [] {
         static_cast<void>(GameIpcCodec::decode_body(
-            "{\"ipc_version\":\"1\",\"type\":\"Shutdown\",\"game_id\":\"game-test-0001\",\"sequence\":\"18446744073709551616\",\"payload\":{\"reason\":\"x\"}}"));
+            "{\"ipc_version\":\"1\",\"type\":\"Shutdown\",\"game_id\":\"game-test-0001\",\"sequence\":\"18446744073709551616\",\"payload\":{\"reason\":\"x\"}}",
+            GameIpcDirection::parent_to_child));
     });
     expect_error("IPC_FRAME_INVALID", [] {
         std::string oversized(game_ipc_maximum_body_size + 1, 'x');
-        static_cast<void>(GameIpcCodec::decode_body(oversized));
+        static_cast<void>(GameIpcCodec::decode_body(
+            oversized, GameIpcDirection::parent_to_child));
     });
     expect_error("IPC_FRAME_INVALID", [] {
         GameIpcMessage oversized = message("PlayerAction", 1, {
@@ -180,6 +188,19 @@ void test_rejections() {
         });
         static_cast<void>(GameIpcCodec::encode_frame(
             oversized, GameIpcDirection::parent_to_child));
+    });
+
+    GameIpcMessage maximum_seed = all_messages().front().first;
+    maximum_seed.payload["seed"] = "99999999999999999999";
+    static_cast<void>(GameIpcCodec::encode_body(
+        maximum_seed, GameIpcDirection::parent_to_child));
+    maximum_seed.payload["seed"] = "00000000000000000000";
+    static_cast<void>(GameIpcCodec::encode_body(
+        maximum_seed, GameIpcDirection::parent_to_child));
+    maximum_seed.payload["seed"] = "100000000000000000000";
+    expect_error("IPC_SCHEMA_INVALID", [&] {
+        static_cast<void>(GameIpcCodec::encode_body(
+            maximum_seed, GameIpcDirection::parent_to_child));
     });
 }
 
@@ -195,7 +216,8 @@ void test_framing() {
         bodies.insert(bodies.end(), next.begin(), next.end());
     }
     require(bodies.size() == 1 &&
-                GameIpcCodec::decode_body(bodies.front()).type == "InitGame",
+                GameIpcCodec::decode_body(
+                    bodies.front(), GameIpcDirection::parent_to_child).type == "InitGame",
             "partial frame was not reassembled");
 
     std::vector<std::uint8_t> combined = first;
@@ -203,6 +225,30 @@ void test_framing() {
     GameIpcFrameDecoder sticky;
     const auto joined = sticky.feed(combined);
     require(joined.size() == 2, "multiple frames were not split");
+
+    GameIpcMessage boundary_message = message("PlayerAction", 1, {
+        {"player_id", "player-a"}, {"action_type", "boundary"},
+        {"data", ""},
+    });
+    const std::size_t boundary_overhead = GameIpcCodec::encode_body(
+        boundary_message, GameIpcDirection::parent_to_child).size();
+    boundary_message.payload["data"] =
+        std::string(game_ipc_maximum_body_size - boundary_overhead, 'x');
+    const auto boundary_frame = GameIpcCodec::encode_frame(
+        boundary_message, GameIpcDirection::parent_to_child);
+    require(boundary_frame.size() == game_ipc_maximum_body_size + 4 &&
+                boundary_frame[0] == 0 && boundary_frame[1] == 0x10 &&
+                boundary_frame[2] == 0 && boundary_frame[3] == 0,
+            "exact 1 MiB GameIPC body boundary was not encoded correctly");
+    GameIpcFrameDecoder boundary_decoder;
+    require(boundary_decoder.feed(boundary_frame).size() == 1,
+            "exact 1 MiB GameIPC frame was not accepted");
+
+    GameIpcFrameDecoder truncated;
+    const auto partial = std::span<const std::uint8_t>{first}.first(first.size() - 1);
+    require(truncated.feed(partial).empty() &&
+                truncated.buffered_bytes() == first.size() - 1,
+            "truncated frame was accepted or discarded before EOF");
 
     for (const std::array<std::uint8_t, 4> header : {
              std::array<std::uint8_t, 4>{0, 0, 0, 0},
@@ -225,6 +271,21 @@ void test_sequences() {
 
     GameIpcSequenceValidator gap;
     expect_error("IPC_SEQUENCE_INVALID", [&] { gap.accept(2); });
+
+    GameIpcSequenceValidator backwards;
+    backwards.accept(1);
+    backwards.accept(2);
+    expect_error("IPC_SEQUENCE_INVALID", [&] { backwards.accept(1); });
+
+    for (const std::string_view invalid : {"0", "01"}) {
+        expect_error("IPC_SCHEMA_INVALID", [&] {
+            const std::string body =
+                "{\"ipc_version\":\"1\",\"type\":\"Shutdown\",\"game_id\":\"game-test-0001\",\"sequence\":\"" +
+                std::string{invalid} + "\",\"payload\":{\"reason\":\"x\"}}";
+            static_cast<void>(GameIpcCodec::decode_body(
+                body, GameIpcDirection::parent_to_child));
+        });
+    }
 
     const auto maximum = std::numeric_limits<std::uint64_t>::max();
     GameIpcSequenceValidator boundary{maximum};

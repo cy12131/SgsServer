@@ -36,6 +36,16 @@ ctest --test-dir /tmp/sgs-m3b1-sanitize --output-on-failure
 - `game_process_manager` 覆盖正常与崩溃退出、管道关闭、绑定错误、初始化超时、事件循环响应性、字节/帧背压、重复停止、SIGTERM→SIGKILL、并发子进程、FD 继承、描述符泄漏和 zombie 回收。
 - `network_integration`、`lobby_room_integration`、`package_manager`、`package_admin_concurrency` 与 `package_sync_integration` 全部通过，证明 M1/M2/M3-A 回归正常。
 
+## M3-B1 第二轮专项审计
+
+审计继续以 SgsArchitecture `ca3e9bab9084050945051b181de5cea55413f9d7` 为准；复核时该提交仍为架构仓库最新 `origin/main`。发现并修复：管理器析构后排队异步回调可能访问失效 `this`；活动子进程的析构兜底只执行一次 `WNOHANG`、可能留下 zombie；Runtime 在未发送终态时以 0 退出可能被误判为成功；codec 的可选 `any` 方向扩大接受域；InitGame seed 被错误缩窄为 uint64 而非 Schema 规定的 1～20 位十进制字符串。
+
+回归测试新增完整 1 MiB 正边界、截断帧、倒退/重复 sequence、子进程两端管道提前关闭、未终态零退出、真实默认 4 MiB/256 帧背压、管理器带待处理回调析构、退出回调中析构以及子进程兜底回收。进程监管专项测试连续运行 50 次全部通过，结束后没有测试子进程或 zombie 残留。最终完整 Debug 与 ASan/UBSan 结果记录在本次修订提交中。
+
+- 第二轮最终 Debug CTest：8/8 通过，总计 19.95 秒。
+- 第二轮最终 ASan + UBSan CTest：8/8 通过，总计 27.62 秒，未报告 sanitizer 错误。
+- 正式架构仓库的 InitGame/GameReady 向量与纳入仓库的测试数据 SHA-256 分别一致；完整架构 Python 验证器的临时依赖安装受当前 SOCKS/直连网络限制，未把该外部工具结果冒充为服务端测试结果。
+
 ## M3-A 历史基线与契约
 
 - 正式目录：`/home/cy/Code/SgsServerRepo`

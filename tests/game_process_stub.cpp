@@ -160,6 +160,14 @@ int main(int argc, char** argv) {
             write_all(arguments.write_descriptor, header.data(), header.size());
             wait_forever();
         }
+        if (arguments.mode == "truncated") {
+            const std::array<std::uint8_t, 4> header{0x00, 0x00, 0x00, 0x40};
+            const std::array<std::uint8_t, 3> partial{'{', '"', 'x'};
+            write_all(arguments.write_descriptor, header.data(), header.size());
+            write_all(arguments.write_descriptor, partial.data(), partial.size());
+            ::close(arguments.write_descriptor);
+            wait_forever();
+        }
         if (arguments.mode == "gap") {
             write_frame(arguments.write_descriptor, ready_from(init, 2));
             wait_forever();
@@ -179,6 +187,26 @@ int main(int argc, char** argv) {
         }
 
         write_frame(arguments.write_descriptor, ready_from(init));
+        if (arguments.mode == "duplicate") {
+            GameIpcMessage output;
+            output.type = "GameOutput";
+            output.game_id = init.game_id;
+            output.sequence = 1;
+            output.payload = {
+                {"recipients", boost::json::array{"player-a"}},
+                {"output_type", "notice"},
+                {"data", boost::json::object{}},
+            };
+            write_frame(arguments.write_descriptor, output);
+            wait_forever();
+        }
+        if (arguments.mode == "close-input") {
+            ::close(arguments.read_descriptor);
+            wait_forever();
+        }
+        if (arguments.mode == "exit-after-ready") {
+            return 0;
+        }
         if (arguments.mode == "ready-then-stall") {
             wait_forever();
         }

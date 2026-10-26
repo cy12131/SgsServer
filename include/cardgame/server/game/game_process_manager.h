@@ -5,6 +5,7 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/json/object.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -142,6 +143,10 @@ private:
     void close_descriptors(const std::shared_ptr<Process>& process);
 
     boost::asio::io_context& io_context_;
+    // 异步回调先检查此令牌，避免管理器析构后再访问裸 this。
+    // GameProcessManager 仍按服务端现有单线程事件模型调用。
+    std::shared_ptr<std::atomic_bool> callback_lifetime_ =
+        std::make_shared<std::atomic_bool>(true);
     std::unordered_map<std::string, std::shared_ptr<Process>> processes_;
     std::unordered_set<std::string> used_game_ids_;
 };

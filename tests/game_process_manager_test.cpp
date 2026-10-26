@@ -13,10 +13,12 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -170,7 +172,9 @@ void test_failures(
         {"invalid-json", "IPC_JSON_INVALID", -1},
         {"unknown-type", "IPC_MESSAGE_TYPE_INVALID", -1},
         {"oversize", "IPC_FRAME_INVALID", -1},
+        {"truncated", "IPC_PIPE_CLOSED", -1},
         {"gap", "IPC_SEQUENCE_INVALID", -1},
+        {"duplicate", "IPC_SEQUENCE_INVALID", -1},
         {"binding-mismatch", "IPC_BINDING_MISMATCH", -1},
         {"close-output", "IPC_PIPE_CLOSED", -1},
         {"no-ready", "IPC_INITIALIZATION_TIMEOUT", -1},
@@ -189,6 +193,31 @@ void test_failures(
                     "crash exit code was not preserved");
         }
     }
+
+    const ScenarioResult early_exit = run_single(
+        executable, root / "exit-after-ready", "exit-after-ready");
+    require((early_exit.exit.failure_code == "IPC_CHILD_EXITED" ||
+             early_exit.exit.failure_code == "IPC_PIPE_CLOSED") &&
+                early_exit.exit.exited && early_exit.exit.exit_code == 0 &&
+                !early_exit.exit.expected,
+            "zero exit before a terminal message was treated as success");
+}
+
+void test_parent_write_pipe_closed(
+    const std::filesystem::path& executable,
+    const std::filesystem::path& root) {
+    const ScenarioResult result = run_single(
+        executable, root / "close-input", "close-input",
+        [](GameProcessManager& manager, const GameLaunchRecord& record,
+           const GameIpcMessage&) {
+            manager.send(record.game_id, "PlayerAction", {
+                {"player_id", "player-a"},
+                {"action_type", "probe-closed-input"},
+                {"data", std::string(128U * 1024U, 'x')},
+            });
+        });
+    require(result.exit.failure_code == "IPC_PIPE_CLOSED",
+            "closed child input pipe was not reported to the target game");
 }
 
 void test_backpressure(
@@ -236,6 +265,41 @@ void test_backpressure(
         });
     require(frame_result.exit.failure_code == "IPC_BACKPRESSURE",
             "frame-count queue limit did not terminate the target game");
+
+    const ScenarioResult default_bytes = run_single(
+        executable, root / "backpressure-default-bytes", "ready-then-stall",
+        [](GameProcessManager& manager, const GameLaunchRecord& record,
+           const GameIpcMessage&) {
+            const std::string near_limit(900U * 1024U, 'b');
+            for (int index = 0; index < 8; ++index) {
+                const auto current = manager.snapshot(record.game_id);
+                if (!current.has_value() || current->failure_code.has_value()) break;
+                manager.send(record.game_id, "PlayerAction", {
+                    {"player_id", "player-a"},
+                    {"action_type", "default-byte-limit"},
+                    {"data", near_limit},
+                });
+            }
+        });
+    require(default_bytes.exit.failure_code == "IPC_BACKPRESSURE",
+            "default 4 MiB queue limit did not terminate the target game");
+
+    const ScenarioResult default_frames = run_single(
+        executable, root / "backpressure-default-frames", "ready-then-stall",
+        [](GameProcessManager& manager, const GameLaunchRecord& record,
+           const GameIpcMessage&) {
+            for (int index = 0; index < 300; ++index) {
+                const auto current = manager.snapshot(record.game_id);
+                if (!current.has_value() || current->failure_code.has_value()) break;
+                manager.send(record.game_id, "PlayerAction", {
+                    {"player_id", "player-a"},
+                    {"action_type", "default-frame-limit"},
+                    {"data", index},
+                });
+            }
+        });
+    require(default_frames.exit.failure_code == "IPC_BACKPRESSURE",
+            "default 256-frame queue limit did not terminate the target game");
 
     const GameProcessOptions defaults;
     require(defaults.maximum_queued_bytes == 4U * 1024U * 1024U &&
@@ -363,6 +427,59 @@ void test_event_loop_remains_responsive(
             "responsive event-loop scenario did not reap the stalled child");
 }
 
+void test_manager_destruction_with_pending_callbacks(
+    const std::filesystem::path& executable,
+    const std::filesystem::path& root) {
+    boost::asio::io_context io;
+    pid_t child = -1;
+    {
+        auto manager = std::make_unique<GameProcessManager>(io);
+        GameProcessOptions settings = options(executable, root, "no-ready");
+        settings.initialization_timeout = 5s;
+        child = manager->start(
+            launch(root / "destroy-pending", "game-destroy-pending"), settings,
+            [](const GameLaunchRecord&, const GameIpcMessage&) {},
+            [](const GameProcessExit&) {});
+    }
+    io.run();
+
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::filesystem::exists("/proc/" + std::to_string(child)) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(2ms);
+    }
+    require(!std::filesystem::exists("/proc/" + std::to_string(child)),
+            "manager destruction left a child or zombie behind");
+}
+
+void test_manager_destruction_from_exit_callback(
+    const std::filesystem::path& executable,
+    const std::filesystem::path& root) {
+    boost::asio::io_context io;
+    auto manager = std::make_unique<GameProcessManager>(io);
+    int exit_notifications = 0;
+    boost::asio::steady_timer watchdog{io};
+    static_cast<void>(manager->start(
+        launch(root / "destroy-in-callback", "game-destroy-in-callback"),
+        options(executable, root, "normal"),
+        [&](const GameLaunchRecord& record, const GameIpcMessage&) {
+            manager->request_stop(record.game_id, "destroy callback test");
+        },
+        [&](const GameProcessExit& result) {
+            require(result.expected, "callback destruction child did not exit normally");
+            ++exit_notifications;
+            manager.reset();
+            watchdog.cancel();
+        }));
+    watchdog.expires_after(4s);
+    watchdog.async_wait([&](const boost::system::error_code& error) {
+        if (!error) throw std::runtime_error{"callback destruction timed out"};
+    });
+    io.run();
+    require(exit_notifications == 1 && manager == nullptr,
+            "manager destruction caused duplicate or missing exit notification");
+}
+
 std::size_t descriptor_count() {
     return static_cast<std::size_t>(std::distance(
         std::filesystem::directory_iterator{"/proc/self/fd"},
@@ -379,11 +496,14 @@ int main(int argc, char** argv) {
         const std::size_t descriptors_before = descriptor_count();
         test_normal_and_fd_isolation(executable, temporary.path());
         test_failures(executable, temporary.path());
+        test_parent_write_pipe_closed(executable, temporary.path());
         test_backpressure(executable, temporary.path());
         test_forced_shutdown(executable, temporary.path());
         test_spawn_failure(temporary.path());
         test_multiple_children_and_duplicate_id(executable, temporary.path());
         test_event_loop_remains_responsive(executable, temporary.path());
+        test_manager_destruction_with_pending_callbacks(executable, temporary.path());
+        test_manager_destruction_from_exit_callback(executable, temporary.path());
         const std::size_t descriptors_after = descriptor_count();
         require(descriptors_after <= descriptors_before + 1,
                 "game process tests leaked file descriptors");

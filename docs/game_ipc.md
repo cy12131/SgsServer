@@ -31,6 +31,8 @@ B1 内部 Runtime CLI 采用 Implementation Candidate：
 
 进程退出由短周期异步 timer 调用 `waitpid(..., WNOHANG)` 检测，网络事件循环不会阻塞等待。正常停止先排队 Shutdown；宽限期后发送 SIGTERM，再超时才发送 SIGKILL。初始化超时、非法协议、管道关闭、非零退出、信号退出和 exec 失败均清理 descriptor/timer，并且退出回调和 reap 只执行一次。PID 在 waitpid 回收前不会被其他进程复用，因此信号只发送给当前记录的子进程。
 
+管理器析构会先使回调生命周期令牌失效，再取消描述符和 timer；因此已排队的完成回调不会访问已销毁的管理器。若析构时仍有活动子进程，兜底路径发送 SIGKILL，并由只等待该 PID 的独立 reaper 回收，避免阻塞 Asio 线程或留下 zombie。正常运行仍应优先调用异步停止流程，而不是依赖析构兜底。
+
 ## 当前安全边界与后续接口
 
 - 测试子进程只持有 GameIPC 管道，不取得 Session、socket、LobbyService 或 RoomManager。

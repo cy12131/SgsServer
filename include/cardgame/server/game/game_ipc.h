@@ -16,7 +16,6 @@ namespace cardgame::server::game {
 inline constexpr std::size_t game_ipc_maximum_body_size = 1'048'576;
 
 enum class GameIpcDirection {
-    any,
     parent_to_child,
     child_to_parent,
 };
@@ -42,13 +41,13 @@ class GameIpcCodec final {
 public:
     [[nodiscard]] static GameIpcMessage decode_body(
         std::string_view body,
-        GameIpcDirection direction = GameIpcDirection::any);
+        GameIpcDirection direction);
     [[nodiscard]] static std::string encode_body(
         const GameIpcMessage& message,
-        GameIpcDirection direction = GameIpcDirection::any);
+        GameIpcDirection direction);
     [[nodiscard]] static std::vector<std::uint8_t> encode_frame(
         const GameIpcMessage& message,
-        GameIpcDirection direction = GameIpcDirection::any);
+        GameIpcDirection direction);
 };
 
 // 增量帧解析器只负责 GameIPC 的 1 MiB 大端长度帧边界。

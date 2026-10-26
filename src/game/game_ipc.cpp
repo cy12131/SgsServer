@@ -219,6 +219,19 @@ void require_length(
     }
 }
 
+void require_decimal_digits(
+    std::string_view text,
+    std::size_t minimum,
+    std::size_t maximum,
+    std::string_view context) {
+    if (text.size() < minimum || text.size() > maximum ||
+        !std::all_of(text.begin(), text.end(), [](char value) {
+            return value >= '0' && value <= '9';
+        })) {
+        fail("IPC_SCHEMA_INVALID", std::string{context} + " decimal string is invalid");
+    }
+}
+
 bool is_lower_hex(std::string_view text) {
     return std::all_of(text.begin(), text.end(), [](char value) {
         return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
@@ -355,9 +368,6 @@ bool known_type(std::string_view type) {
 }
 
 void validate_direction(std::string_view type, GameIpcDirection direction) {
-    if (direction == GameIpcDirection::any) {
-        return;
-    }
     const bool parent_message = type == "InitGame" || type == "PlayerAction" ||
                                 type == "PlayerReply" || type == "Shutdown";
     if ((direction == GameIpcDirection::parent_to_child && !parent_message) ||
@@ -374,8 +384,10 @@ void validate_init_game(const boost::json::object& payload) {
                   false, false, "room_id");
     require_hash(require_string(payload, "manifest_id", "InitGame payload"), "manifest_id");
     require_length(require_string(payload, "mode_id", "InitGame payload"), 1, 128, "mode_id");
-    parse_decimal(require_string(payload, "seed", "InitGame payload"),
-                  true, true, "seed");
+    // Schema 将 seed 定义为 1～20 位十进制字符串，而不是 uint64。
+    // Runtime 后续如何构造确定性 RNG 不应缩窄当前 wire 有效域。
+    require_decimal_digits(require_string(payload, "seed", "InitGame payload"),
+                           1, 20, "seed");
     const boost::json::array& players = require_array(payload, "players", "InitGame payload");
     if (players.size() < 2 || players.size() > 8) {
         fail("IPC_SCHEMA_INVALID", "InitGame players count is invalid");

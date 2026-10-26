@@ -17,6 +17,7 @@
 #include <system_error>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 
@@ -58,6 +59,30 @@ void close_unneeded_child_descriptors() noexcept {
     // 的显式哨兵描述符不会被继承。
     for (int descriptor = 5; descriptor < 4096; ++descriptor) {
         ::close(descriptor);
+    }
+}
+
+void reap_after_manager_destruction(pid_t pid) noexcept {
+    int status = 0;
+    pid_t result = -1;
+    do {
+        result = ::waitpid(pid, &status, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    if (result != 0) {
+        return;
+    }
+
+    // 析构只在服务组件本身结束时走此兜底。等待精确 PID 的工作交给
+    // 独立 reaper，避免阻塞 Asio 线程，同时保证 SIGKILL 后不留 zombie。
+    try {
+        std::thread{[pid] {
+            int child_status = 0;
+            while (::waitpid(pid, &child_status, 0) < 0 && errno == EINTR) {
+            }
+        }}.detach();
+    } catch (...) {
+        // 极端资源耗尽时不能从析构抛异常；SIGKILL 已发送，父进程结束后
+        // 该子进程仍会由 init 接管回收。
     }
 }
 
@@ -184,6 +209,7 @@ GameProcessManager::GameProcessManager(boost::asio::io_context& io_context)
 }
 
 GameProcessManager::~GameProcessManager() {
+    callback_lifetime_->store(false, std::memory_order_release);
     for (auto& [game_id, process] : processes_) {
         static_cast<void>(game_id);
         close_descriptors(process);
@@ -193,8 +219,7 @@ GameProcessManager::~GameProcessManager() {
         process->kill_timer.cancel();
         if (process->pid > 0) {
             ::kill(process->pid, SIGKILL);
-            int status = 0;
-            static_cast<void>(::waitpid(process->pid, &status, WNOHANG));
+            reap_after_manager_destruction(process->pid);
         }
     }
 }
@@ -297,7 +322,11 @@ pid_t GameProcessManager::start(
     begin_read(process);
     schedule_reap(process);
     process->initialization_timer.expires_after(process->options.initialization_timeout);
-    process->initialization_timer.async_wait([this, process](const boost::system::error_code& error) {
+    const auto initialization_lifetime = callback_lifetime_;
+    process->initialization_timer.async_wait([this, process, initialization_lifetime](const boost::system::error_code& error) {
+        if (!initialization_lifetime->load(std::memory_order_acquire)) {
+            return;
+        }
         if (!error && process->state == GameProcessState::initializing) {
             fail_process(process, "IPC_INITIALIZATION_TIMEOUT");
         }
@@ -361,7 +390,11 @@ void GameProcessManager::request_stop(std::string_view game_id, std::string reas
     }
     process->state = GameProcessState::finishing;
     process->shutdown_timer.expires_after(process->options.shutdown_grace);
-    process->shutdown_timer.async_wait([this, process](const boost::system::error_code& error) {
+    const auto shutdown_lifetime = callback_lifetime_;
+    process->shutdown_timer.async_wait([this, process, shutdown_lifetime](const boost::system::error_code& error) {
+        if (!shutdown_lifetime->load(std::memory_order_acquire)) {
+            return;
+        }
         if (!error && process->state != GameProcessState::reaped) {
             if (!process->failure_code.has_value()) {
                 process->failure_code = "IPC_SHUTDOWN_TIMEOUT";
@@ -400,9 +433,13 @@ std::size_t GameProcessManager::active_count() const noexcept {
 }
 
 void GameProcessManager::begin_read(const std::shared_ptr<Process>& process) {
+    const auto lifetime = callback_lifetime_;
     process->read_pipe.async_read_some(
         boost::asio::buffer(process->read_buffer),
-        [this, process](const boost::system::error_code& error, std::size_t count) {
+        [this, process, lifetime](const boost::system::error_code& error, std::size_t count) {
+            if (!lifetime->load(std::memory_order_acquire)) {
+                return;
+            }
             if (error) {
                 if (error != boost::asio::error::operation_aborted &&
                     process->state != GameProcessState::reaped &&
@@ -416,7 +453,8 @@ void GameProcessManager::begin_read(const std::shared_ptr<Process>& process) {
                     std::span<const std::uint8_t>{process->read_buffer.data(), count});
                 for (const std::string& body : bodies) {
                     handle_body(process, body);
-                    if (process->failure_code.has_value()) {
+                    if (!lifetime->load(std::memory_order_acquire) ||
+                        process->failure_code.has_value()) {
                         return;
                     }
                 }
@@ -424,7 +462,9 @@ void GameProcessManager::begin_read(const std::shared_ptr<Process>& process) {
                 fail_process(process, exception.code);
                 return;
             }
-            begin_read(process);
+            if (lifetime->load(std::memory_order_acquire)) {
+                begin_read(process);
+            }
         });
 }
 
@@ -468,13 +508,15 @@ void GameProcessManager::handle_body(
         return;
     }
 
-    if (process->message_handler) {
-        process->message_handler(process->launch, message);
-    }
     if (message.type == "GameFailed") {
         fail_process(process, "IPC_CHILD_REPORTED_FAILURE");
     } else if (message.type == "GameFinished") {
         request_stop(process->launch.game_id, "game finished");
+    }
+    // 先完成框架生命周期转换，再交给观察回调。即使回调销毁管理器，
+    // 当前函数返回前也不会再访问管理器状态。
+    if (process->message_handler) {
+        process->message_handler(process->launch, message);
     }
 }
 
@@ -507,10 +549,14 @@ void GameProcessManager::begin_write(const std::shared_ptr<Process>& process) {
         return;
     }
     process->write_in_progress = true;
+    const auto lifetime = callback_lifetime_;
     boost::asio::async_write(
         process->write_pipe,
         boost::asio::buffer(process->writes.front()),
-        [this, process](const boost::system::error_code& error, std::size_t) {
+        [this, process, lifetime](const boost::system::error_code& error, std::size_t) {
+            if (!lifetime->load(std::memory_order_acquire)) {
+                return;
+            }
             process->write_in_progress = false;
             if (error) {
                 if (error != boost::asio::error::operation_aborted &&
@@ -527,7 +573,11 @@ void GameProcessManager::begin_write(const std::shared_ptr<Process>& process) {
 
 void GameProcessManager::schedule_reap(const std::shared_ptr<Process>& process) {
     process->reap_timer.expires_after(std::chrono::milliseconds{10});
-    process->reap_timer.async_wait([this, process](const boost::system::error_code& error) {
+    const auto lifetime = callback_lifetime_;
+    process->reap_timer.async_wait([this, process, lifetime](const boost::system::error_code& error) {
+        if (!lifetime->load(std::memory_order_acquire)) {
+            return;
+        }
         if (error || process->state == GameProcessState::reaped) {
             return;
         }
@@ -569,8 +619,10 @@ void GameProcessManager::reap(
     if (WIFSIGNALED(wait_status)) {
         result.termination_signal = WTERMSIG(wait_status);
     }
+    // 只有父进程已进入有序停止流程且子进程以 0 退出，才是预期退出。
+    // Runtime 在 GameFinished/Shutdown 之前自行以 0 退出仍属于协议失败。
     if (!process->failure_code.has_value() &&
-        ((!result.exited) || result.exit_code != 0)) {
+        ((!result.exited) || result.exit_code != 0 || !process->stop_requested)) {
         process->failure_code = "IPC_CHILD_EXITED";
     }
     result.failure_code = process->failure_code;
