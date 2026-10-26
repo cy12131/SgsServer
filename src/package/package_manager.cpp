@@ -181,6 +181,138 @@ void require_process(const std::vector<std::string>& arguments, std::string_view
     }
 }
 
+std::vector<std::string> git_base(bool allow_file);
+
+void require_clean_checkout(const std::filesystem::path& directory, bool allow_file) {
+    std::vector<std::string> tracked = git_base(allow_file);
+    tracked.insert(tracked.end(), {
+        "-C", directory.string(), "diff-index", "--quiet", "HEAD", "--"});
+    const ProcessResult tracked_result = run_process(tracked);
+    if (tracked_result.exit_code == 1) {
+        throw PackageError{
+            "PACKAGE_CHECKOUT_DIRTY",
+            "installed checkout has staged, modified, or deleted tracked files"};
+    }
+    if (tracked_result.exit_code != 0) {
+        throw PackageError{
+            "PACKAGE_CHECKOUT_VALIDATION_FAILED",
+            "cannot verify tracked files in installed checkout"};
+    }
+
+    std::vector<std::string> untracked = git_base(allow_file);
+    untracked.insert(untracked.end(), {
+        "-C", directory.string(), "ls-files", "--others",
+        "--exclude-standard", "-z", "--"});
+    const ProcessResult untracked_result = run_process(untracked);
+    if (untracked_result.exit_code != 0) {
+        throw PackageError{
+            "PACKAGE_CHECKOUT_VALIDATION_FAILED",
+            "cannot verify untracked files in installed checkout"};
+    }
+    if (!untracked_result.output.empty()) {
+        throw PackageError{
+            "PACKAGE_CHECKOUT_DIRTY",
+            "installed checkout contains untracked files"};
+    }
+
+    // --exclude-standard 在此处读取仓库的 ignore 规则；配合 --ignored 可将
+    // 通常被常规 status 隐藏的业务文件也视为污染。.git 内部元数据不属于
+    // worktree，不会被 ls-files 当作包内容返回。
+    std::vector<std::string> ignored = git_base(allow_file);
+    ignored.insert(ignored.end(), {
+        "-C", directory.string(), "ls-files", "--others", "--ignored",
+        "--exclude-standard", "-z", "--"});
+    const ProcessResult ignored_result = run_process(ignored);
+    if (ignored_result.exit_code != 0) {
+        throw PackageError{
+            "PACKAGE_CHECKOUT_VALIDATION_FAILED",
+            "cannot verify ignored files in installed checkout"};
+    }
+    if (!ignored_result.output.empty()) {
+        throw PackageError{
+            "PACKAGE_CHECKOUT_DIRTY",
+            "installed checkout contains ignored business files"};
+    }
+}
+
+std::filesystem::path canonical_package_directory(
+    const std::filesystem::path& installs_root,
+    std::string_view package_id,
+    std::string_view commit,
+    const std::filesystem::path& registry_relative) {
+    const std::filesystem::path expected =
+        std::filesystem::path{package_id} / std::filesystem::path{commit};
+    if (registry_relative.empty() || registry_relative.is_absolute() ||
+        registry_relative.generic_string() != expected.generic_string()) {
+        throw PackageError{
+            "INVALID_PACKAGE_REGISTRY",
+            "registry directory must equal <package-id>/<commit>"};
+    }
+
+    const std::filesystem::path target = installs_root / expected;
+    std::error_code status_error;
+    const std::filesystem::file_status status =
+        std::filesystem::symlink_status(target, status_error);
+    if (status_error || !std::filesystem::is_directory(status) ||
+        std::filesystem::is_symlink(status)) {
+        throw PackageError{
+            "INVALID_PACKAGE_REGISTRY",
+            "registered package directory is missing, invalid, or a symbolic link"};
+    }
+    try {
+        const std::filesystem::path canonical_root =
+            std::filesystem::canonical(installs_root);
+        const std::filesystem::path canonical_target =
+            std::filesystem::canonical(target);
+        const std::filesystem::path physical_relative =
+            canonical_target.lexically_relative(canonical_root);
+        if (physical_relative.empty() || physical_relative.is_absolute() ||
+            physical_relative.generic_string() != expected.generic_string()) {
+            throw PackageError{
+                "INVALID_PACKAGE_REGISTRY",
+                "registered package directory escapes or aliases installed root"};
+        }
+    } catch (const PackageError&) {
+        throw;
+    } catch (const std::filesystem::filesystem_error& error) {
+        throw PackageError{
+            "INVALID_PACKAGE_REGISTRY",
+            std::string{"cannot resolve registered package directory: "} + error.what()};
+    }
+    return target;
+}
+
+void validate_install_parent(
+    const std::filesystem::path& installs_root,
+    std::string_view package_id) {
+    const std::filesystem::path parent = installs_root / std::filesystem::path{package_id};
+    std::error_code status_error;
+    const std::filesystem::file_status status =
+        std::filesystem::symlink_status(parent, status_error);
+    if (status_error || !std::filesystem::is_directory(status) ||
+        std::filesystem::is_symlink(status)) {
+        throw PackageError{
+            "PACKAGE_INSTALL_CONFLICT", "package ID directory is not a physical directory"};
+    }
+    try {
+        const std::filesystem::path canonical_root =
+            std::filesystem::canonical(installs_root);
+        const std::filesystem::path physical_relative =
+            std::filesystem::canonical(parent).lexically_relative(canonical_root);
+        if (physical_relative.generic_string() != package_id) {
+            throw PackageError{
+                "PACKAGE_INSTALL_CONFLICT",
+                "package ID directory escapes or aliases installed root"};
+        }
+    } catch (const PackageError&) {
+        throw;
+    } catch (const std::filesystem::filesystem_error& error) {
+        throw PackageError{
+            "PACKAGE_INSTALL_CONFLICT",
+            std::string{"cannot resolve package ID directory: "} + error.what()};
+    }
+}
+
 std::vector<std::string> git_base(bool allow_file) {
     return {"git", "-c", "core.hooksPath=/dev/null", "-c",
             allow_file ? "protocol.file.allow=always" : "protocol.file.allow=never",
@@ -366,10 +498,11 @@ const InstalledPackage& PackageManager::install(
     const std::filesystem::path relative =
         std::filesystem::path{inspected.manifest.id} / inspected.commit;
     const std::filesystem::path final_directory = installs_root_ / relative;
+    std::filesystem::create_directories(final_directory.parent_path());
+    validate_install_parent(installs_root_, inspected.manifest.id);
     if (std::filesystem::exists(final_directory)) {
         throw PackageError{"PACKAGE_INSTALL_CONFLICT", "package install directory already exists"};
     }
-    std::filesystem::create_directories(final_directory.parent_path());
     std::filesystem::rename(staging, final_directory);
     guard.release();
     inspected.directory = final_directory;
@@ -570,6 +703,7 @@ InstalledPackage PackageManager::inspect_checkout(
     if (result.exit_code != 0 || trim(result.output) != commit) {
         throw PackageError{"GIT_COMMIT_MISMATCH", "installed checkout does not match registry commit"};
     }
+    require_clean_checkout(directory, options_.allow_file_repositories_for_tests);
     std::string manifest_sha256;
     PackageManifest manifest = load_and_validate_manifest(
         directory, options_.supported_api_version, &manifest_sha256);
@@ -694,17 +828,23 @@ void PackageManager::load_registry() {
             !object.at("directory").is_string() || !object.at("enabled").is_bool()) {
             throw PackageError{"INVALID_PACKAGE_REGISTRY", "registry package types are invalid"};
         }
-        const std::filesystem::path relative{std::string{object.at("directory").as_string()}};
-        if (relative.empty() || relative.is_absolute() ||
-            relative.lexically_normal().string().starts_with("..")) {
-            throw PackageError{"INVALID_PACKAGE_REGISTRY", "registry path escapes package root"};
+        const std::string package_id{object.at("id").as_string()};
+        const std::string commit{object.at("commit").as_string()};
+        if (!std::regex_match(package_id, sync_package_id_pattern) ||
+            (!is_lower_hex_hash(commit, 40) && !is_lower_hex_hash(commit, 64))) {
+            throw PackageError{
+                "INVALID_PACKAGE_REGISTRY", "registry package id or commit is invalid"};
         }
+        const std::filesystem::path relative{
+            std::string{object.at("directory").as_string()}};
+        const std::filesystem::path directory = canonical_package_directory(
+            installs_root_, package_id, commit, relative);
         InstalledPackage inspected = inspect_checkout(
-            installs_root_ / relative,
+            directory,
             std::string{object.at("repository_url").as_string()},
-            std::string{object.at("commit").as_string()},
+            commit,
             object.at("enabled").as_bool());
-        if (inspected.manifest.id != object.at("id").as_string()) {
+        if (inspected.manifest.id != package_id) {
             throw PackageError{"INVALID_PACKAGE_REGISTRY", "registry id differs from manifest"};
         }
         if (inspected.manifest_sha256 != object.at("manifest_sha256").as_string()) {

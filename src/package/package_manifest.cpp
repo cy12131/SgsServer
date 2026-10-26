@@ -8,13 +8,16 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cctype>
-#include <fstream>
+#include <fcntl.h>
 #include <limits>
 #include <regex>
 #include <set>
 #include <sstream>
+#include <sys/stat.h>
 #include <tuple>
+#include <unistd.h>
 
 namespace cardgame::server::package {
 namespace {
@@ -40,21 +43,115 @@ struct SemVer {
     throw PackageError{"INVALID_PACKAGE_MANIFEST", std::move(message)};
 }
 
-std::string read_manifest(const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
+bool within_root(
+    const std::filesystem::path& canonical_root,
+    const std::filesystem::path& candidate) {
+    const std::filesystem::path resolved = std::filesystem::canonical(candidate);
+    auto root = canonical_root.begin();
+    auto value = resolved.begin();
+    while (root != canonical_root.end() && value != resolved.end() && *root == *value) {
+        ++root;
+        ++value;
+    }
+    return root == canonical_root.end();
+}
+
+class ManifestDescriptor final {
+public:
+    explicit ManifestDescriptor(int descriptor) noexcept : descriptor_(descriptor) {}
+    ~ManifestDescriptor() {
+        if (descriptor_ >= 0) {
+            ::close(descriptor_);
+        }
+    }
+
+    ManifestDescriptor(const ManifestDescriptor&) = delete;
+    ManifestDescriptor& operator=(const ManifestDescriptor&) = delete;
+
+    [[nodiscard]] int get() const noexcept { return descriptor_; }
+    [[nodiscard]] bool close() noexcept {
+        const int descriptor = descriptor_;
+        descriptor_ = -1;
+        return ::close(descriptor) == 0;
+    }
+
+private:
+    int descriptor_;
+};
+
+std::string read_manifest(
+    const std::filesystem::path& package_root,
+    const std::filesystem::path& path) {
+    std::error_code status_error;
+    const std::filesystem::file_status status =
+        std::filesystem::symlink_status(path, status_error);
+    if ((!status_error && !std::filesystem::exists(status)) ||
+        status_error == std::errc::no_such_file_or_directory) {
         throw PackageError{"PACKAGE_MANIFEST_MISSING", "manifest.json is missing"};
     }
-    input.seekg(0, std::ios::end);
-    const auto length = input.tellg();
-    if (length < 0 || static_cast<std::size_t>(length) > maximum_manifest_bytes) {
-        invalid("manifest.json exceeds the 1 MiB validation limit");
+    if (status_error) {
+        throw PackageError{
+            "PACKAGE_MANIFEST_READ_FAILED", "cannot inspect manifest.json"};
     }
-    input.seekg(0, std::ios::beg);
-    std::string bytes(static_cast<std::size_t>(length), '\0');
-    input.read(bytes.data(), length);
-    if (!input || (!bytes.empty() && bytes.starts_with("\xef\xbb\xbf")) ||
-        !is_valid_utf8(bytes)) {
+    if (std::filesystem::is_symlink(status) ||
+        !std::filesystem::is_regular_file(status)) {
+        invalid("manifest.json must be a regular non-symlink file");
+    }
+    try {
+        if (!within_root(std::filesystem::canonical(package_root), path)) {
+            invalid("manifest.json escapes package root");
+        }
+    } catch (const std::filesystem::filesystem_error& error) {
+        throw PackageError{
+            "PACKAGE_MANIFEST_READ_FAILED",
+            std::string{"cannot resolve manifest.json: "} + error.what()};
+    }
+
+    const int opened = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (opened < 0) {
+        if (errno == ENOENT) {
+            throw PackageError{"PACKAGE_MANIFEST_MISSING", "manifest.json is missing"};
+        }
+        throw PackageError{
+            "PACKAGE_MANIFEST_READ_FAILED", "cannot open manifest.json safely"};
+    }
+    ManifestDescriptor descriptor{opened};
+
+    struct stat metadata {};
+    if (::fstat(descriptor.get(), &metadata) != 0 || !S_ISREG(metadata.st_mode)) {
+        invalid("manifest.json must remain a regular file while reading");
+    }
+
+    std::string bytes;
+    if (metadata.st_size > 0) {
+        if (static_cast<std::uintmax_t>(metadata.st_size) > maximum_manifest_bytes) {
+            invalid("manifest.json exceeds the 1 MiB validation limit");
+        }
+        bytes.reserve(static_cast<std::size_t>(metadata.st_size));
+    }
+    std::array<char, 8192> buffer{};
+    while (true) {
+        const ssize_t count = ::read(descriptor.get(), buffer.data(), buffer.size());
+        if (count == 0) {
+            break;
+        }
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw PackageError{
+                "PACKAGE_MANIFEST_READ_FAILED", "cannot read manifest.json"};
+        }
+        if (bytes.size() + static_cast<std::size_t>(count) > maximum_manifest_bytes) {
+            invalid("manifest.json exceeds the 1 MiB validation limit");
+        }
+        bytes.append(buffer.data(), static_cast<std::size_t>(count));
+    }
+    if (!descriptor.close()) {
+        throw PackageError{
+            "PACKAGE_MANIFEST_READ_FAILED", "cannot close manifest.json after reading"};
+    }
+    if ((!bytes.empty() && bytes.starts_with("\xef\xbb\xbf")) || !is_valid_utf8(bytes)) {
         invalid("manifest.json must be UTF-8 without BOM");
     }
     return bytes;
@@ -128,19 +225,6 @@ bool valid_relative_path(std::string_view text, std::string_view suffix = {}) {
         begin = end + 1;
     }
     return true;
-}
-
-bool within_root(
-    const std::filesystem::path& canonical_root,
-    const std::filesystem::path& candidate) {
-    const std::filesystem::path resolved = std::filesystem::canonical(candidate);
-    auto root = canonical_root.begin();
-    auto value = resolved.begin();
-    while (root != canonical_root.end() && value != resolved.end() && *root == *value) {
-        ++root;
-        ++value;
-    }
-    return root == canonical_root.end();
 }
 
 void validate_declared_path(
@@ -262,7 +346,7 @@ PackageManifest load_and_validate_manifest(
     std::string_view supported_api_version,
     std::string* raw_sha256) {
     const std::filesystem::path manifest_path = package_root / "manifest.json";
-    const std::string raw = read_manifest(manifest_path);
+    const std::string raw = read_manifest(package_root, manifest_path);
     if (raw_sha256 != nullptr) {
         *raw_sha256 = sha256(raw);
     }
