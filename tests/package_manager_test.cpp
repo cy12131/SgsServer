@@ -222,11 +222,22 @@ void test_install_and_persistence(const std::filesystem::path& root) {
     const auto& installed = manager.install(file_url(repo), commit);
     require(installed.commit == commit && installed.manifest.id == "org.sgs.base",
             "installed package did not lock expected commit");
+    const auto installed_directory = installed.directory;
     const std::string before = manager.active_manifest().manifest_id;
     const auto& active = manager.enable("org.sgs.base");
     require(active.packages.size() == 1 && active.packages[0].commit == commit,
             "enabled manifest is incorrect");
     require(active.manifest_id != before, "enable did not change manifest id");
+    const auto generation = manager.freeze_generation();
+    require(generation.manifest_id == active.manifest_id &&
+                generation.packages.size() == 1 &&
+                generation.packages[0].id == "org.sgs.base" &&
+                generation.packages[0].commit == commit &&
+                generation.packages[0].root ==
+                    std::filesystem::canonical(installed_directory) &&
+                generation.packages[0].server_entry ==
+                    std::filesystem::path{"server/init.lua"},
+            "frozen Runtime generation did not preserve the canonical owner root");
 
     PackageManager reloaded{options(root / "state")};
     require(reloaded.installed().size() == 1 && reloaded.installed()[0].enabled,

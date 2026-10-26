@@ -1,8 +1,8 @@
 # SgsServer
 
-SgsServer 是独立开发的 Linux 多人在线回合制卡牌游戏服务端。M3-B1 在既有 SGS/1、大厅房间与资源包同步能力上，增加了独立游戏子进程监管和严格 GameIPC/1 通信基础，不依赖 FreeKill。
+SgsServer 是独立开发的 Linux 多人在线回合制卡牌游戏服务端。M3-B2 第一部分在既有 SGS/1、大厅房间、资源包同步和 GameIPC/1 基础上，增加了可执行真实 Lua 5.4 的最小独立 Runtime，不依赖 FreeKill。
 
-当前能力包括 SGS/1 长度前缀帧、Hello/Ping/Echo、M2 大厅与房间、Package Manifest v1 / Package Sync v1，以及 GameIPC/1 编解码、双向 sequence、非阻塞管道、背压和子进程异步回收。服务端可从公开 HTTPS/SSH Git 仓库锁定完整 commit 并原子持久化注册表。GameProcessManager 目前是独立基础组件，尚未接入房间开始流程，也未实现正式 Lua Runtime、永久账号、数据库、私有仓库凭据或资源包热加载。
+当前能力包括 SGS/1 长度前缀帧、Hello/Ping/Echo、M2 大厅与房间、Package Manifest v1 / Package Sync v1，以及 GameIPC/1 编解码、双向 sequence、非阻塞管道、背压和子进程异步回收。服务端可从公开 HTTPS/SSH Git 仓库锁定完整 commit 并原子持久化注册表。最小 Lua Runtime 能校验冻结 generation 和 InitGame、加载各包自己的 server entry、注册 2–8 人模式并返回 GameReady；它尚未接入房间开始流程，也未实现正式规则/请求桥接、永久账号、数据库、私有仓库凭据或资源包热加载。
 
 ## 依赖
 

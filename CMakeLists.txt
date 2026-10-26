@@ -8,6 +8,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Boost 1.83 CONFIG REQUIRED COMPONENTS json)
 find_package(Threads REQUIRED)
+find_library(LUA54_RUNTIME_LIBRARY
+    NAMES lua5.4 lua5.4.so.0 liblua5.4.so.0
+    REQUIRED
+)
+find_path(LUA54_INCLUDE_DIR
+    NAMES lua.h
+    PATH_SUFFIXES lua5.4
+)
 
 function(cardgame_enable_warnings target)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -54,6 +62,24 @@ add_executable(sgs-package-admin
 target_link_libraries(sgs-package-admin PRIVATE cardgame_server_core)
 cardgame_enable_warnings(sgs-package-admin)
 
+# Lua 规则始终运行在独立进程。当前构建环境只有发行版提供的 Lua 5.4
+# 运行库，因此 Runtime 仅使用 src/lua/lua54_abi.h 声明的最小 C ABI。
+add_executable(sgs-lua-runtime
+    src/lua_runtime_main.cpp
+)
+target_include_directories(sgs-lua-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+if(LUA54_INCLUDE_DIR)
+    target_include_directories(sgs-lua-runtime PRIVATE "${LUA54_INCLUDE_DIR}")
+    target_compile_definitions(sgs-lua-runtime PRIVATE
+        CARDGAME_USE_SYSTEM_LUA54_HEADERS=1
+    )
+endif()
+target_link_libraries(sgs-lua-runtime PRIVATE
+    cardgame_server_core
+    "${LUA54_RUNTIME_LIBRARY}"
+)
+cardgame_enable_warnings(sgs-lua-runtime)
+
 include(CTest)
 if(BUILD_TESTING)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -91,6 +117,12 @@ if(BUILD_TESTING)
     target_link_libraries(cardgame-game-process-test PRIVATE cardgame_server_core)
     cardgame_enable_warnings(cardgame-game-process-test)
 
+    add_executable(cardgame-lua-runtime-manager-test
+        tests/lua_runtime_manager_test.cpp
+    )
+    target_link_libraries(cardgame-lua-runtime-manager-test PRIVATE cardgame_server_core)
+    cardgame_enable_warnings(cardgame-lua-runtime-manager-test)
+
     add_test(NAME application_smoke COMMAND cardgame-smoke-test)
     add_test(NAME package_manager COMMAND cardgame-package-test)
     set_tests_properties(package_manager PROPERTIES TIMEOUT 60)
@@ -100,6 +132,18 @@ if(BUILD_TESTING)
         COMMAND cardgame-game-process-test $<TARGET_FILE:cardgame-game-process-stub>
     )
     set_tests_properties(game_process_manager PROPERTIES TIMEOUT 45)
+    add_test(
+        NAME lua_runtime_integration
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/lua_runtime_integration_test.py"
+                "$<TARGET_FILE:sgs-lua-runtime>"
+    )
+    set_tests_properties(lua_runtime_integration PROPERTIES TIMEOUT 20)
+    add_test(
+        NAME lua_runtime_manager
+        COMMAND cardgame-lua-runtime-manager-test $<TARGET_FILE:sgs-lua-runtime>
+    )
+    set_tests_properties(lua_runtime_manager PROPERTIES TIMEOUT 20)
     add_test(
         NAME package_admin_concurrency
         COMMAND "${Python3_EXECUTABLE}"

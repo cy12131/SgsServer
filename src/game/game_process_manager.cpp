@@ -4,6 +4,7 @@
 #include <boost/asio/posix/stream_descriptor.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/write.hpp>
+#include <boost/json/serialize.hpp>
 #include <boost/system/error_code.hpp>
 
 #include <array>
@@ -11,6 +12,7 @@
 #include <csignal>
 #include <deque>
 #include <fcntl.h>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -98,6 +100,28 @@ boost::json::array package_json(const std::vector<GamePackageBinding>& packages)
     return result;
 }
 
+std::string package_argument(const GamePackageBinding& package) {
+    boost::json::object value{
+        {"id", package.id},
+        {"version", package.version},
+        {"commit", package.commit},
+        {"root", package.root.string()},
+        {"server_entry", nullptr},
+    };
+    if (package.server_entry) {
+        value["server_entry"] = package.server_entry->generic_string();
+    }
+    return boost::json::serialize(value);
+}
+
+std::string player_argument(const GamePlayerBinding& player) {
+    return boost::json::serialize(boost::json::object{
+        {"player_id", player.player_id},
+        {"seat", player.seat},
+        {"display_name", player.display_name},
+    });
+}
+
 boost::json::array player_json(const std::vector<GamePlayerBinding>& players) {
     boost::json::array result;
     result.reserve(players.size());
@@ -157,18 +181,70 @@ bool recipients_belong_to_game(
     return true;
 }
 
+bool path_is_within(
+    const std::filesystem::path& root,
+    const std::filesystem::path& candidate) {
+    auto root_part = root.begin();
+    auto candidate_part = candidate.begin();
+    for (; root_part != root.end(); ++root_part, ++candidate_part) {
+        if (candidate_part == candidate.end() || *root_part != *candidate_part) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void validate_launch(const GameLaunchRecord& launch, const GameProcessOptions& options) {
+    if (launch.players.size() < 2 || launch.players.size() > 8) {
+        throw std::invalid_argument{"runtime roster must contain 2 to 8 players"};
+    }
+    if (launch.packages.empty()) {
+        throw std::invalid_argument{"runtime generation must contain at least one package"};
+    }
+    for (const GamePackageBinding& package : launch.packages) {
+        if (package.id.empty() || package.version.empty() || package.commit.empty() ||
+            !package.root.is_absolute()) {
+            throw std::invalid_argument{"runtime package binding is incomplete"};
+        }
+        const auto root = std::filesystem::canonical(package.root);
+        if (!std::filesystem::is_directory(root) ||
+            std::filesystem::is_symlink(std::filesystem::symlink_status(package.root))) {
+            throw std::invalid_argument{"runtime package root is not a physical directory"};
+        }
+        if (package.server_entry) {
+            if (package.server_entry->is_absolute() ||
+                package.server_entry->lexically_normal() != *package.server_entry) {
+                throw std::invalid_argument{"runtime package entry is not a normalized relative path"};
+            }
+            const auto entry = std::filesystem::canonical(root / *package.server_entry);
+            if (!path_is_within(root, entry) || !std::filesystem::is_regular_file(entry) ||
+                std::filesystem::is_symlink(
+                    std::filesystem::symlink_status(root / *package.server_entry))) {
+                throw std::invalid_argument{"runtime package entry escapes its owner root"};
+            }
+        }
+    }
+    if (options.maximum_queued_bytes == 0 || options.maximum_queued_frames == 0 ||
+        options.maximum_log_line_bytes == 0 ||
+        options.maximum_log_records_per_second == 0) {
+        throw std::invalid_argument{"runtime queue and log limits must be positive"};
+    }
+}
+
 }  // namespace
 
 struct GameProcessManager::Process {
     Process(boost::asio::io_context& io, GameLaunchRecord launch_value,
             GameProcessOptions options_value, MessageHandler message_value,
-            ExitHandler exit_value)
+            ExitHandler exit_value, LogHandler log_value)
         : launch{std::move(launch_value)},
           options{std::move(options_value)},
           message_handler{std::move(message_value)},
           exit_handler{std::move(exit_value)},
+          log_handler{std::move(log_value)},
           read_pipe{io},
           write_pipe{io},
+          log_pipe{io},
           initialization_timer{io},
           reap_timer{io},
           shutdown_timer{io},
@@ -178,16 +254,19 @@ struct GameProcessManager::Process {
     GameProcessOptions options;
     MessageHandler message_handler;
     ExitHandler exit_handler;
+    LogHandler log_handler;
     pid_t pid = -1;
     std::string child_identity;
     GameProcessState state = GameProcessState::starting;
     boost::asio::posix::stream_descriptor read_pipe;
     boost::asio::posix::stream_descriptor write_pipe;
+    boost::asio::posix::stream_descriptor log_pipe;
     boost::asio::steady_timer initialization_timer;
     boost::asio::steady_timer reap_timer;
     boost::asio::steady_timer shutdown_timer;
     boost::asio::steady_timer kill_timer;
     std::array<std::uint8_t, 16U * 1024U> read_buffer{};
+    std::array<std::uint8_t, 16U * 1024U> log_buffer{};
     GameIpcFrameDecoder frame_decoder;
     GameIpcSequenceGenerator outgoing_sequence;
     GameIpcSequenceValidator incoming_sequence;
@@ -197,6 +276,14 @@ struct GameProcessManager::Process {
     bool stop_requested = false;
     bool descriptors_closed = false;
     bool exit_reported = false;
+    std::uint64_t log_bytes_read = 0;
+    std::uint64_t log_records_suppressed = 0;
+    std::uint64_t log_lines_truncated = 0;
+    std::size_t current_log_line_bytes = 0;
+    bool discarding_log_line = false;
+    std::chrono::steady_clock::time_point log_window_started =
+        std::chrono::steady_clock::now();
+    std::size_t log_records_in_window = 0;
     std::optional<std::string> failure_code;
     std::unordered_set<std::string> child_request_tokens;
 };
@@ -210,7 +297,8 @@ struct GameProcessManager::State final
         GameLaunchRecord launch,
         GameProcessOptions options,
         MessageHandler message_handler,
-        ExitHandler exit_handler);
+        ExitHandler exit_handler,
+        LogHandler log_handler);
     void send(
         std::string_view game_id,
         std::string type,
@@ -224,6 +312,11 @@ struct GameProcessManager::State final
     void shutdown() noexcept;
 
     void begin_read(const std::shared_ptr<Process>& process);
+    void begin_log_read(const std::shared_ptr<Process>& process);
+    void emit_log_record(
+        const std::shared_ptr<Process>& process,
+        std::size_t byte_count,
+        bool truncated);
     void handle_body(const std::shared_ptr<Process>& process, std::string_view body);
     void enqueue(const std::shared_ptr<Process>& process, GameIpcMessage message);
     void begin_write(const std::shared_ptr<Process>& process);
@@ -274,7 +367,8 @@ pid_t GameProcessManager::State::start(
     GameLaunchRecord launch,
     GameProcessOptions options,
     MessageHandler message_handler,
-    ExitHandler exit_handler) {
+    ExitHandler exit_handler,
+    LogHandler log_handler) {
     if (shutting_down) {
         throw std::logic_error{"game process manager is shutting down"};
     }
@@ -288,24 +382,35 @@ pid_t GameProcessManager::State::start(
         !std::filesystem::is_directory(options.working_directory)) {
         throw std::invalid_argument{"runtime working directory must be an existing absolute path"};
     }
-    if (!launch.package_root.is_absolute() ||
-        options.maximum_queued_bytes == 0 || options.maximum_queued_frames == 0) {
-        throw std::invalid_argument{"runtime package root and queue limits are invalid"};
+    validate_launch(launch, options);
+    // 后续 argv 只携带验证后的物理根，避免 Runtime 再看到别名路径。
+    for (GamePackageBinding& package : launch.packages) {
+        package.root = std::filesystem::canonical(package.root);
     }
 
     auto process = std::make_shared<Process>(
         io_context, std::move(launch), std::move(options),
-        std::move(message_handler), std::move(exit_handler));
+        std::move(message_handler), std::move(exit_handler), std::move(log_handler));
 
     // fork 前先完成所有可能分配内存的 argv/env 构造。子进程只调用
     // async-signal-safe 的 fd/chdir/exec 系统调用。
     std::vector<std::string> arguments{
         process->options.executable.string(),
         "--game-id", process->launch.game_id,
-        "--package-root", process->launch.package_root.string(),
+        "--room-id", process->launch.room_id,
+        "--manifest-id", process->launch.manifest_id,
+        "--mode-id", process->launch.mode_id,
         "--ipc-read", std::to_string(child_read_descriptor),
         "--ipc-write", std::to_string(child_write_descriptor),
     };
+    for (const auto& package : process->launch.packages) {
+        arguments.emplace_back("--package");
+        arguments.push_back(package_argument(package));
+    }
+    for (const auto& player : process->launch.players) {
+        arguments.emplace_back("--player");
+        arguments.push_back(player_argument(player));
+    }
     arguments.insert(arguments.end(), process->options.extra_arguments.begin(),
                      process->options.extra_arguments.end());
     std::vector<char*> argv;
@@ -322,11 +427,13 @@ pid_t GameProcessManager::State::start(
 
     std::array<int, 2> parent_to_child{-1, -1};
     std::array<int, 2> child_to_parent{-1, -1};
+    std::array<int, 2> child_log{-1, -1};
     int child_read = -1;
     int child_write = -1;
     try {
         make_pipe(parent_to_child);
         make_pipe(child_to_parent);
+        make_pipe(child_log);
         child_read = duplicate_child_end(parent_to_child[0]);
         child_write = duplicate_child_end(child_to_parent[1]);
         close_if_open(parent_to_child[0]);
@@ -336,6 +443,8 @@ pid_t GameProcessManager::State::start(
         close_if_open(parent_to_child[1]);
         close_if_open(child_to_parent[0]);
         close_if_open(child_to_parent[1]);
+        close_if_open(child_log[0]);
+        close_if_open(child_log[1]);
         close_if_open(child_read);
         close_if_open(child_write);
         throw;
@@ -345,7 +454,9 @@ pid_t GameProcessManager::State::start(
     if (child == 0) {
         if (::chdir(process->options.working_directory.c_str()) != 0 ||
             ::dup2(child_read, child_read_descriptor) < 0 ||
-            ::dup2(child_write, child_write_descriptor) < 0) {
+            ::dup2(child_write, child_write_descriptor) < 0 ||
+            ::dup2(child_log[1], STDOUT_FILENO) < 0 ||
+            ::dup2(child_log[1], STDERR_FILENO) < 0) {
             _exit(126);
         }
         close_unneeded_child_descriptors();
@@ -354,9 +465,11 @@ pid_t GameProcessManager::State::start(
     }
     close_if_open(child_read);
     close_if_open(child_write);
+    close_if_open(child_log[1]);
     if (child < 0) {
         close_if_open(parent_to_child[1]);
         close_if_open(child_to_parent[0]);
+        close_if_open(child_log[0]);
         throw std::system_error{errno, std::generic_category(), "fork"};
     }
 
@@ -365,10 +478,12 @@ pid_t GameProcessManager::State::start(
     process->state = GameProcessState::initializing;
     process->read_pipe.assign(child_to_parent[0]);
     process->write_pipe.assign(parent_to_child[1]);
+    process->log_pipe.assign(child_log[0]);
     processes.emplace(process->launch.game_id, process);
     used_game_ids.insert(process->launch.game_id);
 
     begin_read(process);
+    begin_log_read(process);
     schedule_reap(process);
     process->initialization_timer.expires_after(process->options.initialization_timeout);
     const auto initialization_state = shared_from_this();
@@ -474,7 +589,9 @@ std::optional<GameProcessSnapshot> GameProcessManager::State::snapshot(
     const Process& process = *found->second;
     return GameProcessSnapshot{
         process.launch, process.pid, process.child_identity, process.state,
-        process.queued_bytes, process.writes.size(), process.failure_code};
+        process.queued_bytes, process.writes.size(), process.log_bytes_read,
+        process.log_records_suppressed, process.log_lines_truncated,
+        process.failure_code};
 }
 
 std::size_t GameProcessManager::State::active_count() const noexcept {
@@ -517,6 +634,72 @@ void GameProcessManager::State::begin_read(const std::shared_ptr<Process>& proce
         });
 }
 
+void GameProcessManager::State::emit_log_record(
+    const std::shared_ptr<Process>& process,
+    std::size_t byte_count,
+    bool truncated) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - process->log_window_started >= std::chrono::seconds{1}) {
+        process->log_window_started = now;
+        process->log_records_in_window = 0;
+    }
+    if (process->log_records_in_window >=
+        process->options.maximum_log_records_per_second) {
+        ++process->log_records_suppressed;
+        return;
+    }
+    ++process->log_records_in_window;
+    if (process->log_handler) {
+        // 不向主进程传播不可信 Runtime 原文，避免泄露玩家数据或凭据。
+        const std::string summary = "runtime output suppressed bytes=" +
+            std::to_string(byte_count) + (truncated ? " truncated=true" : "");
+        process->log_handler(process->launch, summary);
+    }
+}
+
+void GameProcessManager::State::begin_log_read(
+    const std::shared_ptr<Process>& process) {
+    const auto state = shared_from_this();
+    process->log_pipe.async_read_some(
+        boost::asio::buffer(process->log_buffer),
+        [state, process](const boost::system::error_code& error, std::size_t count) {
+            if (state->shutting_down) {
+                return;
+            }
+            if (error) {
+                // 日志 EOF/关闭不改变 GameIPC 生命周期；reaper 仍负责最终回收。
+                return;
+            }
+            process->log_bytes_read += count;
+            for (std::size_t index = 0; index < count; ++index) {
+                const bool newline = process->log_buffer[index] == '\n';
+                if (!newline) {
+                    if (process->current_log_line_bytes <=
+                        process->options.maximum_log_line_bytes) {
+                        ++process->current_log_line_bytes;
+                    }
+                    if (process->current_log_line_bytes >
+                        process->options.maximum_log_line_bytes) {
+                        process->discarding_log_line = true;
+                    }
+                    continue;
+                }
+                const bool truncated = process->discarding_log_line;
+                if (truncated) {
+                    ++process->log_lines_truncated;
+                }
+                state->emit_log_record(
+                    process,
+                    std::min(process->current_log_line_bytes,
+                             process->options.maximum_log_line_bytes),
+                    truncated);
+                process->current_log_line_bytes = 0;
+                process->discarding_log_line = false;
+            }
+            state->begin_log_read(process);
+        });
+}
+
 void GameProcessManager::State::handle_body(
     const std::shared_ptr<Process>& process,
     std::string_view body) {
@@ -541,7 +724,8 @@ void GameProcessManager::State::handle_body(
         }
         process->initialization_timer.cancel();
         process->state = GameProcessState::running;
-    } else if (process->state != GameProcessState::running) {
+    } else if (message.type != "GameFailed" &&
+               process->state != GameProcessState::running) {
         fail_process(process, "IPC_STATE_INVALID");
         return;
     }
@@ -728,16 +912,20 @@ void GameProcessManager::State::close_descriptors(
     process->read_pipe.close(ignored);
     process->write_pipe.cancel(ignored);
     process->write_pipe.close(ignored);
+    process->log_pipe.cancel(ignored);
+    process->log_pipe.close(ignored);
 }
 
 pid_t GameProcessManager::start(
     GameLaunchRecord launch,
     GameProcessOptions options,
     MessageHandler message_handler,
-    ExitHandler exit_handler) {
+    ExitHandler exit_handler,
+    LogHandler log_handler) {
     return state_->start(
         std::move(launch), std::move(options),
-        std::move(message_handler), std::move(exit_handler));
+        std::move(message_handler), std::move(exit_handler),
+        std::move(log_handler));
 }
 
 void GameProcessManager::send(
