@@ -227,7 +227,7 @@ void write_message(int descriptor, const GameIpcMessage& message) {
 std::string lua_string(lua_State* state, int table, const char* field) {
     lua_getfield(state, table, field);
     if (lua_type(state, -1) != lua_type_string) fail("Lua registration string is invalid");
-    unsigned long size = 0;
+    std::size_t size = 0;
     const char* value = lua_tolstring(state, -1, &size);
     std::string result{value, size};
     lua_pop(state, 1);
@@ -298,7 +298,7 @@ int lua_register_package(lua_State* state) {
 }
 
 std::string lua_error_text(lua_State* state) {
-    unsigned long size = 0;
+    std::size_t size = 0;
     const char* value = lua_tolstring(state, -1, &size);
     return value == nullptr ? "Lua runtime error" : std::string{value, size};
 }
@@ -332,6 +332,10 @@ void push_json(lua_State* state, const boost::json::value& value) {
 void load_packages(RuntimeContext& context, lua_State* state) {
     if (state == nullptr) fail("cannot create Lua state");
     luaL_requiref(state, "_G", luaopen_base, 1);
+    lua_pop(state, 1);
+    // 规则集合和有序玩家数据需要纯内存 table 库；不开放 package、io、
+    // os、debug，也不提供任何动态库或文件加载入口。
+    luaL_requiref(state, "table", luaopen_table, 1);
     lua_pop(state, 1);
     lua_pushnil(state); lua_setglobal(state, "dofile");
     lua_pushnil(state); lua_setglobal(state, "loadfile");

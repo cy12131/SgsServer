@@ -12,9 +12,10 @@ commit、canonical owner root 和相对 `server.entry`；每个 `--player` 参�
 也不读取 registry、`.staging` 或 Git 分支。入口必须是所属物理包根内的普通
 文件，符号链接或路径逃逸会在 fork 前或 Runtime 初始化时被拒绝。
 
-Runtime 使用系统 Lua 5.4 运行库及项目内部的最小 C ABI 声明。只打开 Lua
-base library，不继承 `LUA_PATH` / `LUA_CPATH`，并移除 `dofile` 和
-`loadfile`。包按 generation 顺序加载，并通过
+Runtime 使用系统 Lua 5.4 运行库；CMake 优先采用匹配的 Lua 5.4 开发头，
+仅在当前系统缺少开发包时退回项目内部的最小 C ABI 声明。只打开 Lua
+base 与纯内存 `table` 库，不开放 `package`、`io`、`os`、`debug`，不继承
+`LUA_PATH` / `LUA_CPATH`，并移除 `dofile` 和 `loadfile`。包按 generation 顺序加载，并通过
 `Runtime.registerPackage{...}` 与 `pkg:registerGameMode{...}` 注册自身和模式。
 InitGame 必须逐项匹配 CLI 中冻结的 game、room、manifest、packages 和
 roster；模式人数范围限定在框架的 2–8 人内。创建最小 Game 上下文成功后，

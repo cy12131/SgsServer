@@ -186,7 +186,8 @@ def main():
         (root / "server.lua").write_text(
             "local p=Runtime.registerPackage({id='org.sgs.runtime-test',version='1.0.0'})\n"
             "p:registerGameMode({id='standard',min_players=2,max_players=8,"
-            "create_logic=function(ctx) assert(ctx.player_count>=2); return {} end})\n",
+            "create_logic=function(ctx) local v={}; table.insert(v,ctx.player_count); "
+            "assert(v[1]>=2); return {} end})\n",
             encoding="utf-8",
         )
         test_ready(runtime, root, 2)

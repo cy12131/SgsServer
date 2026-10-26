@@ -12,6 +12,10 @@ find_library(LUA54_RUNTIME_LIBRARY
     NAMES lua5.4 lua5.4.so.0 liblua5.4.so.0
     REQUIRED
 )
+find_path(LUA54_INCLUDE_DIR
+    NAMES lua.h
+    PATH_SUFFIXES lua5.4
+)
 
 function(cardgame_enable_warnings target)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -64,6 +68,12 @@ add_executable(sgs-lua-runtime
     src/lua_runtime_main.cpp
 )
 target_include_directories(sgs-lua-runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+if(LUA54_INCLUDE_DIR)
+    target_include_directories(sgs-lua-runtime PRIVATE "${LUA54_INCLUDE_DIR}")
+    target_compile_definitions(sgs-lua-runtime PRIVATE
+        CARDGAME_USE_SYSTEM_LUA54_HEADERS=1
+    )
+endif()
 target_link_libraries(sgs-lua-runtime PRIVATE
     cardgame_server_core
     "${LUA54_RUNTIME_LIBRARY}"
