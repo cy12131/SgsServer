@@ -605,6 +605,36 @@ const ActiveManifest& PackageManager::active_manifest() const noexcept {
     return active_;
 }
 
+PackageGeneration PackageManager::freeze_generation() const {
+    PackageGeneration generation;
+    generation.manifest_id = active_.manifest_id;
+    generation.packages.reserve(active_.packages.size());
+    for (const SyncPackage& active_package : active_.packages) {
+        const auto found = std::find_if(
+            installed_.begin(), installed_.end(), [&](const InstalledPackage& installed) {
+                return installed.manifest.id == active_package.id &&
+                       installed.commit == active_package.commit && installed.enabled;
+            });
+        if (found == installed_.end()) {
+            throw PackageError{
+                "INVALID_PACKAGE_GENERATION",
+                "active package has no matching installed checkout"};
+        }
+        RuntimePackageRoot package{
+            found->manifest.id,
+            found->manifest.version,
+            found->commit,
+            std::filesystem::canonical(found->directory),
+            std::nullopt,
+        };
+        if (found->manifest.server_entry) {
+            package.server_entry = std::filesystem::path{*found->manifest.server_entry};
+        }
+        generation.packages.push_back(std::move(package));
+    }
+    return generation;
+}
+
 void PackageManager::set_manifest_changed_handler(ManifestChangedHandler handler) {
     on_manifest_changed_ = std::move(handler);
 }

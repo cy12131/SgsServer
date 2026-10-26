@@ -55,13 +55,13 @@ GameLaunchRecord launch(const std::filesystem::path& root, std::string id) {
         std::move(id),
         "7",
         std::string(64, 'a'),
-        {{"org.sgs.test", std::string(40, '1')}},
+        {{"org.sgs.test", "1.0.0", std::string(40, '1'),
+          std::filesystem::absolute(package_root), std::nullopt}},
         "standard",
         {{"player-a", 1, "甲"}, {"player-b", 2, "乙"}},
         "424242",
         boost::json::object{{"rounds", 1}},
         "init_token_00000001",
-        std::filesystem::absolute(package_root),
     };
 }
 

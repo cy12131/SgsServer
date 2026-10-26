@@ -23,7 +23,10 @@ namespace cardgame::server::game {
 
 struct GamePackageBinding {
     std::string id;
+    std::string version;
     std::string commit;
+    std::filesystem::path root;
+    std::optional<std::filesystem::path> server_entry;
 
     bool operator==(const GamePackageBinding&) const = default;
 };
@@ -48,7 +51,6 @@ struct GameLaunchRecord {
     std::string seed;
     boost::json::object settings;
     std::string init_token;
-    std::filesystem::path package_root;
 };
 
 enum class GameProcessState {
@@ -70,6 +72,8 @@ struct GameProcessOptions {
     std::chrono::milliseconds terminate_grace{500};
     std::size_t maximum_queued_bytes = 4U * 1024U * 1024U;
     std::size_t maximum_queued_frames = 256;
+    std::size_t maximum_log_line_bytes = 4096;
+    std::size_t maximum_log_records_per_second = 32;
 };
 
 struct GameProcessSnapshot {
@@ -79,6 +83,9 @@ struct GameProcessSnapshot {
     GameProcessState state = GameProcessState::starting;
     std::size_t queued_bytes = 0;
     std::size_t queued_frames = 0;
+    std::uint64_t log_bytes_read = 0;
+    std::uint64_t log_records_suppressed = 0;
+    std::uint64_t log_lines_truncated = 0;
     std::optional<std::string> failure_code;
 };
 
@@ -98,6 +105,8 @@ public:
     using MessageHandler =
         std::function<void(const GameLaunchRecord&, const GameIpcMessage&)>;
     using ExitHandler = std::function<void(const GameProcessExit&)>;
+    using LogHandler =
+        std::function<void(const GameLaunchRecord&, std::string_view safe_record)>;
 
     explicit GameProcessManager(boost::asio::io_context& io_context);
     ~GameProcessManager();
@@ -109,7 +118,8 @@ public:
         GameLaunchRecord launch,
         GameProcessOptions options,
         MessageHandler message_handler,
-        ExitHandler exit_handler);
+        ExitHandler exit_handler,
+        LogHandler log_handler = {});
 
     // sequence 和 game_id 由父进程覆盖生成，调用者不能自行指定 wire 身份。
     void send(

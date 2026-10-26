@@ -1,4 +1,4 @@
-# GameIPC/1 与独立游戏进程（M3-B1）
+# GameIPC/1 与独立游戏进程（M3-B2 第一部分）
 
 本模块实现 SgsArchitecture `ca3e9bab9084050945051b181de5cea55413f9d7` 中 M3-B1 的进程与通信基础。它与客户端 SGS/1 完全分离，当前也没有接入房间“开始游戏”流程或执行 Lua 规则。
 
@@ -12,16 +12,17 @@ GameIPC 帧为四字节无符号大端正文长度加 UTF-8 JSON，正文必须�
 
 ## 启动记录与进程边界
 
-`GameProcessManager` 在 fork 前按值固定 `game_id → {room_id, manifest_id, ordered packages, mode_id, roster/seats, seed, settings, init token, package root}`。同一管理器生命周期内 game_id 不可复用；启动后额外记录 PID 形式的 child identity。InitGame 只从该不可变记录生成，GameReady 必须回显 init token、mode 和完整有序包集合，任何不一致均以 `IPC_BINDING_MISMATCH` 终止目标进程。
+`GameProcessManager` 在 fork 前按值固定 `game_id → {room_id, manifest_id, ordered packages及各自canonical root, mode_id, roster/seats, seed, settings, init token}`。同一管理器生命周期内 game_id 不可复用；启动后额外记录 PID 形式的 child identity。InitGame 只从该不可变记录生成，GameReady 必须回显 init token、mode 和完整有序包集合，任何不一致均以 `IPC_BINDING_MISMATCH` 终止目标进程。
 
-B1 内部 Runtime CLI 采用 Implementation Candidate：
+B2 内部 Runtime CLI 采用以下受控形式（`--package` / `--player` 可重复）：
 
 ```text
-<executable> --game-id <id> --package-root <absolute-path> \
-  --ipc-read 3 --ipc-write 4 [test/runtime-specific arguments]
+sgs-lua-runtime --game-id <id> --room-id <uint64-string> \
+  --manifest-id <sha256> --mode-id <id> --ipc-read 3 --ipc-write 4 \
+  --package <json-binding>... --player <json-binding>...
 ```
 
-父进程不用 shell，而是使用绝对可执行路径和 argv 调用 `execve`。环境缩减为 PATH、LANG 和 TZ，cwd 显式指定；只把 FD 3/4 两个目标管道及标准 FD 保留给子进程，其他描述符通过 close_range 或兼容回退关闭。Runtime CLI、标准输出/错误日志管道和只读 generation 挂载仍需在 B2 接入真实 Runtime 时冻结；替换成本局限于启动器参数构造，不影响 codec 和异步通道。
+父进程不用 shell，而是使用绝对可执行路径和 argv 调用 `execve`。环境缩减为 PATH、LANG 和 TZ，cwd 显式指定；只保留 FD 3/4、标准 FD 及 stdout/stderr 指向的受控日志写端，其他描述符通过 close_range 或兼容回退关闭。每个包参数都绑定锁定 commit、独立 owner root 和相对入口，不存在共享包搜索目录。
 
 ## 非阻塞 I/O、背压和回收
 
@@ -41,8 +42,8 @@ B1 内部 Runtime CLI 采用 Implementation Candidate：
 - 父进程生成 game_id 和 sequence，并验证子进程的 game_id、token、包集合以及 PlayerRequest/GameOutput recipients 均属于冻结 roster。
 - IPC 成功只代表传输和外层 Schema 有效，不代表动作合法或规则安全。
 - `GameProcessManager` 当前作为独立核心组件构建和测试，尚未由 TcpServer/RoomManager 创建真实对局。
-- B2 需要提供受限 Lua Runtime、只读 generation、最终 CLI/FD 协议、stdout/stderr 限流净化，以及包入口加载和真实 GameReady。
-- B1 stub 不写 stdout/stderr；当前子进程仍继承父进程的 FD 1/2。B2 启动真实 Runtime 前必须改为独立异步日志通道：持续排空，单条截断，按局限流，敏感字段净化，并使用有界 sink 队列。队列满时丢弃新日志并累计一次摘要，不能停止读取管道或无限扩张内存。
+- M3-B2 第一部分已提供最小 Lua 5.4 Runtime、冻结 generation、包入口加载、真实 GameReady，以及持续排空、单条计数上限和按局限速的日志通道；日志回调只收到安全统计摘要，不收到 Lua 原文。
+- 正式生产沙箱仍需增加 CPU/内存/FD 配额、只读文件系统视图和完整 Lua API 权限限制。
 - B3/B4 仍需完成 Request token 状态表与 deadline、正式 Lua 事件/协程桥接、定向视图路由、CPU/内存/FD/文件系统限制和失败日志净化。
 
 测试使用专用 `cardgame-game-process-stub`，覆盖合法 Init/GameReady、分片读写、非法 JSON/类型/长度/sequence、绑定不一致、初始化超时、崩溃、EOF、字节/帧背压、重复停止、SIGTERM→SIGKILL、多个并发子进程、FD 继承和 zombie 检查。该 stub 不是 Lua Runtime，也不随生产服务启动。

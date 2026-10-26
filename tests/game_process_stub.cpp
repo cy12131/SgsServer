@@ -41,7 +41,9 @@ Arguments parse_arguments(int count, char** values) {
         else if (name == "--ipc-write") result.write_descriptor = std::stoi(value);
         else if (name == "--mode") result.mode = value;
         else if (name == "--sentinel-fd") result.sentinel_descriptor = std::stoi(value);
-        else if (name == "--package-root") static_cast<void>(value);
+        else if (name == "--room-id" || name == "--manifest-id" ||
+                 name == "--mode-id" || name == "--package" ||
+                 name == "--player") static_cast<void>(value);
         else throw std::runtime_error{"unknown argument"};
     }
     if (result.game_id.empty() || result.read_descriptor < 0 ||
